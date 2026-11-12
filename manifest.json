@@ -1,0 +1,37 @@
+{
+  "id": "alma-meme-watcher",
+  "name": "Meme Watcher",
+  "version": "0.1.0",
+  "description": "监控 B 站「梗指南」(UID 94510621) 新投稿并提取出处与词义，同步到 Alma 的 meme_radar.db 词库。",
+  "author": {
+    "name": "HSJ-BanFan",
+    "url": "https://github.com/HSJ-BanFan"
+  },
+  "main": "main.js",
+  "engines": {
+    "alma": "^0.1.0"
+  },
+  "type": "tool",
+  "permissions": [
+    "tools:register",
+    "settings:read",
+    "notifications"
+  ],
+  "activationEvents": [
+    "onStartup"
+  ],
+  "contributes": {
+    "tools": [
+      {
+        "id": "meme_watch_status",
+        "name": "Meme Watcher Status",
+        "description": "查看当前梗指南监控状态、最近同步的视频和词条统计。"
+      },
+      {
+        "id": "meme_watch_sync",
+        "name": "Sync Memes from GengZhiNan",
+        "description": "拉取 B 站 UP 主「梗指南」最新投稿，提取字幕/转写并同步带出处的梗词条。"
+      }
+    ]
+  }
+}
