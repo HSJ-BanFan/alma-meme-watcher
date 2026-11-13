@@ -397,7 +397,7 @@ export function migrateCommunity(request) {
   }
   if (operation === 'stage') {
     const plan = createPlan(request);
-    const temporary = mkdtempSync(join(tmpdir(), 'meme-integration-stage-'));
+    const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'meme-integration-stage-')));
     const stageDir = join(temporary, 'skill');
     try {
       cpSync(plan.sourceRoot, stageDir, { recursive: true, filter: (path) => basename(path) !== '__pycache__' && !/\.py[co]$/.test(path) && basename(path) !== '.meme-integration.lock' });

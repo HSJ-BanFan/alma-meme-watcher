@@ -97,6 +97,30 @@ test('ordinary reads reproduce the implicit-lookup defect, then staging removes 
   assert.ok(replayPlan.files.every((record) => record.preimage.sha256 === record.postimage.sha256));
 });
 
+test('the staging CLI works when the temporary directory is a junction or symlink', (t) => {
+  const env = prepare(t);
+  const physical = join(env.root, 'physical temp');
+  const alias = join(env.root, 'temporary alias');
+  mkdirSync(physical);
+  symlinkSync(physical, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const before = snapshot(env.skillDir);
+  const policyBefore = readFileSync(join(env.almaHome, 'state', 'meme_tone.json'));
+  const stage = spawnSync(process.execPath, [cli, 'stage', `--skill-dir=${env.skillDir}`,
+    `--plugin-root=${env.pluginRoot}`, `--alma-home=${env.almaHome}`], {
+    cwd: env.cwd, env: { ...process.env, HOME: env.root, USERPROFILE: env.root,
+      TMP: alias, TEMP: alias, TMPDIR: alias }, encoding: 'utf8', timeout: 10000,
+  });
+  assert.equal(stage.error, undefined);
+  assert.equal(stage.status, 0, stage.stderr);
+  assert.equal(stage.stderr, '');
+  const staged = JSON.parse(stage.stdout);
+  assert.equal(staged.status, 'staged');
+  t.after(() => rmSync(dirname(staged.stageDir), { recursive: true, force: true }));
+  successfulProbe(staged.stageDir, { ...env, compare: env.skillDir });
+  assert.deepEqual(snapshot(env.skillDir), before);
+  assert.deepEqual(readFileSync(join(env.almaHome, 'state', 'meme_tone.json')), policyBefore);
+});
+
 test('staging preserves literal replacement characters in plugin and Alma roots', (t) => {
   const script = String.raw`import json, math, runpy, subprocess, sys
 from pathlib import Path
