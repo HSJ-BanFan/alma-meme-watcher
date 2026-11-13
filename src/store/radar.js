@@ -437,13 +437,23 @@ const standardMetadataDescription = [
 ];
 const standardMetadataDigest = maintenanceDigest(standardMetadataDescription);
 const quoteColumn = (name) => `"${name.replaceAll('"', '""')}"`;
-const snapshotValue = (value) => value instanceof Uint8Array ? { sqlite_blob: Buffer.from(value).toString('hex') } : value;
+const snapshotValue = (value) => value instanceof Uint8Array ? { sqlite_blob: Buffer.from(value).toString('hex') }
+  : typeof value === 'bigint' ? { sqlite_integer: value.toString() } : value;
 const sqliteValue = (value) => value && typeof value === 'object' && Object.hasOwn(value, 'sqlite_blob') ? Buffer.from(value.sqlite_blob, 'hex') : value;
 const snapshotRow = (row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, snapshotValue(value)]));
 const rowsEqual = (a, b) => maintenanceDigest(a) === maintenanceDigest(b);
 const identityKeys = (term) => new Set([term.term, ...decodeAliases(term.aliases)].map(identity));
 const isRejected = (value) => value.trim().toLowerCase() === 'rejected';
 const maintenanceRows = (db, table) => db.prepare(`SELECT * FROM ${table}`).all().map(snapshotRow).sort((a, b) => compare(a.term, b.term));
+
+function maintenanceOtherTables(db) {
+  return [...tableNames(db)].filter((name) => !Object.hasOwn(maintenanceColumns, name)).sort(compare).map((name) => {
+    const statement = db.prepare(`SELECT * FROM ${quoteColumn(name)}`);
+    statement.setReadBigInts(true);
+    const rows = statement.all().map((row) => JSON.stringify(snapshotRow(row))).sort(compare);
+    return { name, rows };
+  });
+}
 
 function maintenanceState(db) {
   const tables = tableNames(db);
@@ -504,6 +514,7 @@ function maintenanceState(db) {
   }
   return {
     terms, termReviews, candidateReviews, owners, template,
+    otherTables: maintenanceOtherTables(db),
     termsByName: new Map(terms.map((term) => [term.term, term])),
     metadataByName: new Map(metadata.map((row) => [row.term, row])),
     metadataSchema: metadataDescription ? maintenanceDigest(metadataDescription) : null,
@@ -647,7 +658,8 @@ function assertMaintenanceRows(db, state, metadata, termReviews = state.termRevi
   if (!rowsEqual(maintenanceRows(db, 'terms'), state.terms)
     || !rowsEqual(maintenanceRows(db, 'term_reviews'), termReviews)
     || !rowsEqual(maintenanceRows(db, 'candidate_reviews'), state.candidateReviews)
-    || !rowsEqual(maintenanceRows(db, 'watcher_entry_meta'), sortedMeta)) {
+    || !rowsEqual(maintenanceRows(db, 'watcher_entry_meta'), sortedMeta)
+    || !rowsEqual(maintenanceOtherTables(db), state.otherTables)) {
     fail('DATABASE_ERROR', 'A database trigger changed protected maintenance material.');
   }
 }
@@ -766,7 +778,8 @@ export function applyMaintenanceReviews(reviews, { dbPath, now = Date.now() / 10
         }
         if (state.metadataSchema === null) {
           if (!rowsEqual(maintenanceRows(db, 'terms'), state.terms) || !rowsEqual(maintenanceRows(db, 'candidate_reviews'), state.candidateReviews)
-            || !rowsEqual(maintenanceRows(db, 'term_reviews'), expectedReviews) || tableNames(db).has('watcher_entry_meta')) {
+            || !rowsEqual(maintenanceRows(db, 'term_reviews'), expectedReviews) || tableNames(db).has('watcher_entry_meta')
+            || !rowsEqual(maintenanceOtherTables(db), state.otherTables)) {
             fail('DATABASE_ERROR', 'A database trigger changed protected review material.');
           }
         } else {
