@@ -14,6 +14,17 @@ Alma 插件：全网多源热梗监控与编译入库引擎。
    - 仓库日常由 Alma 负责监控、调度、编写 Issue、审查 PR 与版本迭代。
    - 插件运行时负责日常素材抓取与词条落盘，代码维护与数据流水线清晰解耦。
 
+## 只读词卡查询
+
+外部调用方可通过 CLI 查询词卡，无需导入内部模块。
+
+```bash
+node scripts/lookup.mjs --text "玉芬啊玉芬"
+node scripts/lookup.mjs --text "帖子文本" --db "/path/to/meme_radar.db" --limit 3
+```
+
+无命中返回 `{"terms":[]}`，退出码为 `0`。词库不可用时 stderr 返回错误 JSON，退出码非 `0`。参数、十字段词卡和错误码见[词卡查询接口](docs/lookup-api.md)。
+
 ## 本地验证
 
 ```bash

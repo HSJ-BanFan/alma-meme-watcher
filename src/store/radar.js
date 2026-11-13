@@ -112,7 +112,8 @@ function currentEntries(db, tables = tableNames(db)) {
   const hasMeta = tables.has('watcher_entry_meta');
   const reviewColumns = hasReviews ? 'r.status AS review_status, r.reviewed_at, r.source_url, r.actor AS review_actor' : "'unreviewed_legacy' AS review_status, NULL AS reviewed_at, '' AS source_url, NULL AS review_actor";
   const metaColumns = hasMeta ? 'm.usage_context, m.avoid_when, m.published_at' : "'' AS usage_context, '' AS avoid_when, NULL AS published_at";
-  const rows = db.prepare(`SELECT t.*, ${reviewColumns}, ${metaColumns} FROM terms t
+  const rows = db.prepare(`SELECT t.term, t.aliases, t.meaning, t.example, t.origin, t.tags,
+    t.first_seen, t.last_seen, t.heat, t.confidence, t.ttl_days, t.source, ${reviewColumns}, ${metaColumns} FROM terms t
     ${hasReviews ? 'LEFT JOIN term_reviews r ON r.term=t.term' : ''}
     ${hasMeta ? 'LEFT JOIN watcher_entry_meta m ON m.term=t.term' : ''}`).all();
   return rows.map((row) => ({
@@ -265,9 +266,11 @@ export function syncEntries(entries, { dbPath = defaultDbPath, now = Date.now() 
   });
 }
 
-function eligible(entry, now) {
-  return ['accepted', 'local_reference'].includes(entry.review_status) && entry.confidence >= 0.7
-    && (entry.ttl_days <= 0 || entry.last_seen + entry.ttl_days * 86400 > now);
+function eligibility(entry, now) {
+  if (!['accepted', 'local_reference'].includes(entry.review_status) || !(entry.confidence >= 0.7)) return null;
+  if (entry.ttl_days <= 0) return { days_left: null };
+  const remaining = entry.last_seen + entry.ttl_days * 86400 - now;
+  return remaining > 0 ? { days_left: Math.ceil(remaining / 86400) } : null;
 }
 
 function contains(text, key) {
@@ -282,22 +285,89 @@ function contains(text, key) {
   return false;
 }
 
+function matchKeys(entry, query) {
+  const seen = new Set();
+  const matched_keys = [];
+  let rank = null;
+  for (const [index, value] of [entry.term, ...entry.aliases].entries()) {
+    const key = identity(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const exact = key === query;
+    if (!exact && !contains(query, key)) continue;
+    matched_keys.push(value);
+    const keyRank = index === 0 ? exact ? 0 : 2 : exact ? 1 : 3;
+    rank = rank === null ? keyRank : Math.min(rank, keyRank);
+  }
+  return rank === null ? null : { rank, matched_keys };
+}
+
+function selectHits(entries, text, now, limit) {
+  const query = identity(text);
+  if (!query || limit === 0) return [];
+  const hits = [];
+  for (const entry of entries) {
+    const lifetime = eligibility(entry, now);
+    if (lifetime === null) continue;
+    const match = matchKeys(entry, query);
+    if (match !== null) hits.push({ entry, ...match, days_left: lifetime.days_left });
+  }
+  return hits
+    .sort((a, b) => a.rank - b.rank || b.entry.heat - a.entry.heat || b.entry.last_seen - a.entry.last_seen || compare(identity(a.entry.term), identity(b.entry.term)))
+    .slice(0, limit);
+}
+
+function validateReadEntry(entry) {
+  const strings = ['term', 'meaning', 'usage_context', 'avoid_when', 'origin', 'source_url', 'review_status'];
+  const numbers = ['confidence', 'ttl_days', 'last_seen', 'heat'];
+  if (strings.some((field) => typeof entry[field] !== 'string')
+    || !Array.isArray(entry.aliases) || entry.aliases.some((alias) => typeof alias !== 'string')
+    || numbers.some((field) => typeof entry[field] !== 'number' || !Number.isFinite(entry[field]))) {
+    fail('DATABASE_ERROR', '词库包含无法读取的词条字段。');
+  }
+}
+
+function projectCard({ entry, matched_keys, days_left }) {
+  if (days_left !== null && (!Number.isInteger(days_left) || days_left <= 0)) {
+    fail('DATABASE_ERROR', '词库包含无法读取的词条有效期。');
+  }
+  return {
+    term: entry.term,
+    meaning: entry.meaning,
+    usage_context: entry.usage_context,
+    avoid_when: entry.avoid_when,
+    origin: entry.origin,
+    source_url: entry.source_url,
+    aliases: entry.aliases,
+    matched_keys,
+    confidence: entry.confidence,
+    days_left,
+  };
+}
+
+export function lookupCards(text, { dbPath = defaultDbPath, now = Date.now() / 1000, limit = 3 } = {}) {
+  options(dbPath, now);
+  if (typeof text !== 'string' || !Number.isSafeInteger(limit) || limit < 0) fail('INVALID_OPTIONS', '查询文本必须是字符串，limit 必须是非负安全整数。');
+  const cards = withDatabase(dbPath, false, (db) => {
+    db.exec('BEGIN');
+    try {
+      const tables = tableNames(db);
+      if (!tables.has('terms')) fail('DATABASE_ERROR', '词库缺少 terms 表。');
+      const entries = currentEntries(db, tables);
+      entries.forEach(validateReadEntry);
+      return selectHits(entries, text, now, limit).map(projectCard);
+    } finally {
+      db.exec('ROLLBACK');
+    }
+  });
+  if (cards === null) fail('DATABASE_UNAVAILABLE', '词库不可用。');
+  return cards;
+}
+
 export function lookup(text, { dbPath = defaultDbPath, now = Date.now() / 1000, limit = 3 } = {}) {
   options(dbPath, now);
   if (typeof text !== 'string' || !Number.isInteger(limit) || limit < 0) fail('INVALID_OPTIONS', '查询文本必须是字符串，limit 必须是非负整数。');
-  const query = identity(text);
-  return withDatabase(dbPath, false, (db) => currentEntries(db)
-    .filter((entry) => query && eligible(entry, now))
-    .map((entry) => {
-      const term = identity(entry.term);
-      const aliases = entry.aliases.map(identity);
-      const rank = term === query ? 0 : aliases.includes(query) ? 1 : contains(query, term) ? 2 : aliases.some((alias) => contains(query, alias)) ? 3 : 4;
-      return { entry, rank };
-    })
-    .filter((hit) => hit.rank < 4)
-    .sort((a, b) => a.rank - b.rank || b.entry.heat - a.entry.heat || b.entry.last_seen - a.entry.last_seen || compare(identity(a.entry.term), identity(b.entry.term)))
-    .slice(0, limit)
-    .map((hit) => hit.entry)) ?? [];
+  return withDatabase(dbPath, false, (db) => selectHits(currentEntries(db), text, now, limit).map((hit) => hit.entry)) ?? [];
 }
 
 export function radarStatus({ dbPath = defaultDbPath, now = Date.now() / 1000 } = {}) {
@@ -308,6 +378,6 @@ export function radarStatus({ dbPath = defaultDbPath, now = Date.now() / 1000 } 
     const count = (table) => tables.has(table) ? db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n : 0;
     const last = tables.has('watcher_sync_versions')
       ? db.prepare('SELECT source_url,applied_at FROM watcher_sync_versions ORDER BY applied_at DESC,source_url,term,fingerprint LIMIT 1').get() : null;
-    return { ...empty, terms: count('terms'), candidates: count('candidates'), eligible: currentEntries(db, tables).filter((entry) => eligible(entry, now)).length, last_sync: last ? { source_url: last.source_url, applied_at: last.applied_at } : null };
+    return { ...empty, terms: count('terms'), candidates: count('candidates'), eligible: currentEntries(db, tables).filter((entry) => eligibility(entry, now) !== null).length, last_sync: last ? { source_url: last.source_url, applied_at: last.applied_at } : null };
   }) ?? empty;
 }
