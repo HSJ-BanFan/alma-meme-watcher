@@ -1,0 +1,49 @@
+import json
+import math
+import subprocess
+from pathlib import Path
+
+
+class ReadProblem(RuntimeError):
+    def __init__(self, code: str, scope: str = ""):
+        self.code, self.scope = code, scope
+        super().__init__(code)
+
+
+class PublicKnowledge:
+    def __init__(self, entry: Path | None = None, runner=None):
+        self.entry = entry or Path("D:/02_Dev/Projects/alma-meme-watcher/scripts/lookup.mjs")
+        self.runner = runner or subprocess.run
+
+    def lookup(self, text: str, limit: int = 3) -> list[dict]:
+        try:
+            completed = self.runner(["node", str(self.entry), "--text=" + text, "--limit", str(limit)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    encoding="utf-8", errors="strict", timeout=5, shell=False)
+            if completed.returncode != 0 or completed.stderr or not completed.stdout:
+                raise ReadProblem("knowledge_unavailable")
+            result = json.loads(completed.stdout)
+            if not isinstance(result, dict) or set(result) != {"terms"} or not isinstance(result["terms"], list) or len(result["terms"]) > limit:
+                raise ReadProblem("knowledge_unavailable")
+            strings = {"term", "meaning", "usage_context", "avoid_when", "origin", "source_url"}
+            fields = strings | {"aliases", "matched_keys", "confidence", "days_left"}
+            for card in result["terms"]:
+                if (not isinstance(card, dict) or set(card) != fields or any(not isinstance(card[key], str) for key in strings) or
+                        any(not isinstance(card[key], list) or any(not isinstance(value, str) for value in card[key])
+                            for key in ("aliases", "matched_keys")) or
+                        type(card["confidence"]) not in {int, float} or not math.isfinite(card["confidence"]) or
+                        (card["days_left"] is not None and (type(card["days_left"]) is not int or card["days_left"] <= 0))):
+                    raise ReadProblem("knowledge_unavailable")
+            return result["terms"]
+        except ReadProblem:
+            raise
+        except Exception as error:
+            raise ReadProblem("knowledge_unavailable") from error
+
+
+def reaction_receipt(kind, post_id, uid, raw):
+    return {"kind": kind, "post_id": post_id, "uid": uid, "raw": raw}
+
+
+def verify_account(account):
+    return {"uid": account.uid, "alias": account.alias}

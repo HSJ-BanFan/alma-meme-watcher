@@ -1,0 +1,140 @@
+def _meme_notes(text: str, link_id: str = "") -> list[str]:
+    try:
+        from community_bindings import PublicKnowledge
+        return ["〔词条〕%s：%s" % (card["term"], card["meaning"]) for card in PublicKnowledge().lookup(text)]
+    except Exception:
+        return ["knowledge_unavailable"]
+
+
+def read_post(link_id: str, hot: int = 3) -> str:
+    """把帖子转写成一段能读的话。段落和图按原顺序走，图片给本地路径。"""
+    p = fetch_post(link_id)
+    blocks = p.get("blocks") or []
+    locals_ = p.get("local_images") or []
+    lines = ["《%s》  楼主 %s" % (p.get("title") or "", p.get("author") or "匿名")]
+    meta = []
+    if p.get("create_at"):
+        meta.append(_fmt_time(p.get("create_at")))
+    stats = []
+    if p.get("up"):
+        stats.append("顶 %d" % p["up"])
+    if p.get("award_num"):
+        stats.append("充电 %d" % p["award_num"])
+    stats.append("评论 %d" % _as_int(p.get("comment_num")))
+    meta.append(" · ".join(stats))
+    if p.get("topics"):
+        meta.append("话题 " + " / ".join(p["topics"]))
+    if p.get("is_favour"):
+        meta.append("已收藏")
+    lines.append("  " + " · ".join(x for x in meta if x))
+    if not blocks:
+        body = (p.get("desc") or "").strip()
+        lines.append(body if body else "（没写正文）")
+    img_index = 0
+    for kind, payload in blocks:
+        if kind == "text":
+            lines.append(payload)
+        else:
+            local = locals_[img_index] if img_index < len(locals_) else ""
+            img_index += 1
+            lines.append("〔第 %d 张图%s〕" % (
+                img_index, "：" + local if local else "（没下下来）"))
+    if p.get("images") and img_index == 0:
+        lines.append("（正文里没有图位置，原帖带 %d 张图）" % len(p["images"]))
+    comments = p.get("comments") or []
+    if comments:
+        lines.append("…… 已有评论（只给摘要，回复前用 read_floor 读全文）……")
+        for c in comments[:hot]:
+            extra = []
+            if c.get("up"):
+                extra.append("顶 %d" % c["up"])
+            if c.get("child_num"):
+                extra.append("%d 条回复" % c["child_num"])
+            tag = "（%s）" % " · ".join(extra) if extra else ""
+            lines.append("  %s%s〔cid=%s〕：%s" % (
+                c.get("author") or "", tag, c.get("comment_id") or "",
+                c.get("text") or ""))
+    notes = _meme_notes("\n".join(lines), link_id)
+    if notes:
+        lines.extend(notes)
+    lines.append("地址：%s" % post_url(link_id))
+    return "\n".join(lines)
+
+
+def read_floor(link_id: str, comment_id: str) -> str:
+    """按精确评论 ID 读取本页命中楼层，保留返回文本，不下载图片或更新已读。"""
+    if link_id is None or not str(link_id).strip():
+        raise ValueError("缺少 link_id")
+    if comment_id is None or not str(comment_id).strip():
+        raise ValueError("缺少 comment_id")
+    link_id = str(link_id)
+    comment_id = str(comment_id)
+    client = _get_client()
+    _gate_arm()
+    try:
+        floors = list(client.comment_thread(link_id, page=1, limit=50))
+    except Exception as exc:
+        if "show_captcha" in str(exc):
+            _gate_hit()
+        raise
+    _gate_ok()
+    for floor in floors:
+        root = floor.get("root") or {}
+        nodes = [root] + (floor.get("replies") or [])
+        if not any(str(n.get("commentid")) == comment_id for n in nodes):
+            continue
+        root_id = root.get("commentid")
+        if root_id is None or not str(root_id).strip():
+            raise ValueError("命中楼层缺少可用 root_id")
+        root_id = str(root_id)
+        on_page = {str(n.get("commentid")): n for n in nodes}
+        lines = [
+            "本页返回的楼层上下文 page=1 limit=50，不保证全部祖先或回复。",
+            "link_id=%s root_id=%s 目标 cid=%s" % (link_id, root_id, comment_id),
+        ]
+        for index, n in enumerate(nodes):
+            cid = str(n.get("commentid"))
+            label = "根评论" if index == 0 else "回复"
+            if cid == comment_id:
+                label += " · 目标"
+            when = _fmt_time(n.get("create_at"))
+            up = _as_int(n.get("up"))
+            bits = [label, "cid=" + cid]
+            if when:
+                bits.append(when)
+            if up:
+                bits.append("顶 %d" % up)
+            author = (n.get("user") or {}).get("username") or "匿名"
+            head = "〔%s〕%s" % (" · ".join(bits), author)
+            if index > 0:
+                parent_id = str(n.get("replyid") or "")
+                reply_to = _username(n.get("replyuser")) or _username(
+                    (on_page.get(parent_id) or {}).get("user"))
+                if parent_id and parent_id == root_id:
+                    head += "  ↳ 回复根评论"
+                elif reply_to:
+                    head += "  ↳ 回复 @%s" % reply_to
+                if parent_id and parent_id not in on_page:
+                    head += "（接的那句不在本页 cid=%s）" % parent_id
+            lines.append(head)
+            text = _clean_text(n.get("text"))
+            lines.append(text if text else "（没有文字）")
+            imgs = n.get("imgs")
+            if isinstance(imgs, list):
+                for url in imgs:
+                    if isinstance(url, str) and url:
+                        lines.append("图片地址：%s" % url)
+        notes = _meme_notes("\n".join(lines), link_id)
+        if notes:
+            lines.extend(notes)
+        lines.append("地址：https://www.xiaoheihe.cn/bbs/app/link/web/view?link_id=%s" % link_id)
+        return "\n".join(lines)
+    raise ValueError("本页未找到 comment_id=%s 的楼层" % comment_id)
+
+
+def _prepare_upload(path):
+    return {"file": path, "account": "fixture-account"}
+
+
+def send_comment(link_id, text):
+    return {"link_id": link_id, "text": text}
