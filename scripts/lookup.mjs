@@ -1,13 +1,7 @@
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { lookupCards } from '../src/store/radar.js';
-
-const failures = {
-  INVALID_ARGUMENTS: { exit: 2, message: 'Invalid lookup arguments.' },
-  DATABASE_UNAVAILABLE: { exit: 1, message: 'Meme database is unavailable.' },
-  DATABASE_ERROR: { exit: 1, message: 'Meme database could not be read.' },
-  INTERNAL_ERROR: { exit: 1, message: 'Lookup failed unexpectedly.' },
-};
+import { lookupFailures as failures, lookupFailureCode } from '../src/lookup/errors.js';
 
 function invalidArguments() {
   throw Object.assign(new Error(failures.INVALID_ARGUMENTS.message), { code: 'INVALID_ARGUMENTS' });
@@ -42,7 +36,7 @@ export function runCli(argv) {
     process.stdout.write(`${JSON.stringify({ terms })}\n`);
     return 0;
   } catch (error) {
-    const code = Object.hasOwn(failures, error?.code) ? error.code : 'INTERNAL_ERROR';
+    const code = lookupFailureCode(error?.code);
     const { exit, message } = failures[code];
     process.stderr.write(`${JSON.stringify({ error: { code, message } })}\n`);
     return exit;

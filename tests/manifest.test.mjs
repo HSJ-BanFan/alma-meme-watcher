@@ -15,23 +15,23 @@ async function register(dbPath) {
   const registered = [];
   await activate({
     logger: { info() {} },
-    tools: { register: (tool) => registered.push(tool) },
+    tools: { register: (id, descriptor) => { registered.push({ id, ...descriptor }); return { dispose() {} }; } },
   }, { dbPath });
   return registered;
 }
 
-test('manifest.json is valid and declares both required tool IDs', () => {
+test('manifest.json is valid and declares the three tool IDs', () => {
   const manifest = JSON.parse(readFileSync(resolve(root, 'manifest.json'), 'utf8'));
   assert.equal(manifest.id, 'alma-meme-watcher');
   assert.equal(manifest.main, 'main.js');
-  assert.deepEqual(manifest.contributes.tools.map((tool) => tool.id).sort(), ['meme_watch_status', 'meme_watch_sync']);
+  assert.deepEqual(manifest.contributes.tools.map((tool) => tool.id).sort(), ['meme_watch_lookup', 'meme_watch_status', 'meme_watch_sync']);
 });
 
-test('main.js registers both declared tool IDs and missing-db status remains read-only', async (t) => {
+test('main.js registers the declared tool IDs and missing-db status remains read-only', async (t) => {
   const dbPath = temporaryRadar(t);
   t.after(deactivate);
   const registered = await register(dbPath);
-  assert.deepEqual(registered.map((tool) => tool.id).sort(), ['meme_watch_status', 'meme_watch_sync']);
+  assert.deepEqual(registered.map((tool) => tool.id).sort(), ['meme_watch_lookup', 'meme_watch_status', 'meme_watch_sync']);
   const res = await registered.find((tool) => tool.id === 'meme_watch_status').execute();
   assert.deepEqual(res, {
     ok: true,

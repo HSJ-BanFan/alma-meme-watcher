@@ -31,6 +31,11 @@
         "id": "meme_watch_sync",
         "name": "Sync Memes from Watcher",
         "description": "执行多源素材拉取、字幕/转写提取与带出处的结构化热梗词条同步入库。"
+      },
+      {
+        "id": "meme_watch_lookup",
+        "name": "Lookup Meme Cards",
+        "description": "只读查询梗词库，返回十字段词卡（词义、用法场景、避用条件、出处、别名、命中键、置信度、剩余有效期）。无命中返回空数组；词库缺失或损坏是故障。不写入、不补字段、不刷新有效期。"
       }
     ]
   }
