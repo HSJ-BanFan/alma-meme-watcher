@@ -93,6 +93,69 @@ lookupCards(text, { dbPath, now, limit })
 
 已有 `lookup` 仍返回内部词条，`radarStatus` 仍返回原有统计。两者缺失文件时的空结果兼容性不变。新接口不以该宽松行为隐藏数据库故障。
 
+## 插件工具接口
+
+插件注册只读工具 `meme_watch_lookup`。它和 CLI 共用 `lookupCards`，匹配、排序、审核门槛、TTL 和只读语义完全一致，没有第二套检索实现。
+
+安装后宿主给工具加的前缀是 `plugin--alma-meme-watcher--meme_watch_lookup`。这个名称由宿主生成，属于命名约定，不是本仓库已验证的事实；调用前沿用会话的工具发现能力确认工具是否存在及其输入定义。
+
+### 输入
+
+```json
+{"type":"object","additionalProperties":false,"required":["text"],
+ "properties":{"text":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":3}}}
+```
+
+`text` 必填，允许空字符串和纯空白。`limit` 省略时按 `3` 处理；一旦出现，就必须是 `0` 到 `Number.MAX_SAFE_INTEGER` 的安全整数。除 `text` 和 `limit` 之外的键（例如 `dbPath`、`now`）一律拒绝，避免调用方绕过契约直接指定数据库或时钟。
+
+### 输出
+
+成功返回 `{"ok":true,"terms":[...]}`，`terms` 是十字段词卡数组，字段与 CLI 相同。无命中是 `{"ok":true,"terms":[]}`。
+
+失败返回 `{"ok":false,"code":"...","message":"..."}`。工具用自己的固定消息，不转发底层异常文本，因此消息里不会出现本地路径、堆栈或密钥。
+
+| `code` | 条件 |
+|---|---|
+| `INVALID_ARGUMENTS` | 输入违反上述契约。包含词库层抛出的 `INVALID_OPTIONS`。 |
+| `DATABASE_UNAVAILABLE` | 数据库文件或其父路径不存在。 |
+| `DATABASE_ERROR` | 数据库无法打开、损坏、缺少表或列，或字段不可读。 |
+| `INTERNAL_ERROR` | 其他未预期错误。 |
+
+工具信封与 CLI 信封不同，不要混用。CLI 成功只有 `terms`，失败只有 `error.code` 和 `error.message`。
+
+查询不创建词条、不补字段、不刷新有效期，也不改动词库内容。
+
+### 生命周期
+
+`activate(context, { dbPath })` 按 `tools.register(id, { description, parameters, execute })` 注册三个工具，并返回 `{ dispose }`。`dispose` 幂等，只释放本次激活注册的工具；`deactivate()` 释放当前所有仍存活的注册。`dbPath` 未传时走词库默认路径。
+
+## 打包与安装
+
+```bash
+node scripts/package-plugin.mjs --out <目录>
+node scripts/install-plugin.mjs --alma-home <Alma 配置根> [--package <包目录>] [--plan]
+node scripts/install-plugin.mjs --alma-home <Alma 配置根> [--package <包目录>] --apply
+node scripts/install-plugin.mjs --alma-home <Alma 配置根> --rollback <备份 ID>
+node scripts/install-plugin.mjs --alma-home <Alma 配置根> --uninstall
+node scripts/install-plugin.mjs --alma-home <Alma 配置根> --list
+```
+
+`package-plugin.mjs` 按显式白名单收集 `main.js`、`manifest.json`、`package.json`、`docs/lookup-api.md` 以及 `src/`、`scripts/`、`skills/`、`integrations/` 下现有文件，复制到 `<目录>/alma-meme-watcher/`，并写入 `package-receipt.json`。
+
+回执字段是 `schema`、`plugin`（`id`、`name`、`version`）、`revision`（构建时的 Git HEAD）、`dirty`（白名单文件是否有未提交改动）和 `files`（按路径排序的 `path`、`bytes`、`sha256`）。回执不含构建时间，所以同一提交重复打包得到逐字节相同的 `files`。
+
+`--alma-home` 默认取 `os.homedir()/.config/alma`，安装目标是其下的 `plugins/alma-meme-watcher`，备份放在 `_backup/`。默认动作是 `--plan`，只报告将要做什么，不写任何文件。
+
+`--apply` 先校验包内每个文件的哈希，再处理目标目录：目标不存在就直接安装；目标存在但由其他来源创建则拒绝覆盖；目标存在且与本包一致则报告 `unchanged`，不产生备份。替换前把旧目录整体移到 `_backup/plugin-alma-meme-watcher-<UTC 时间戳>/` 并写 `backup.json`，新装目录内写 `.install-receipt.json`。
+
+`--rollback <备份 ID>` 校验备份后换回旧目录并删除本次安装。`--uninstall` 只删除带安装回执的目录。`--list` 列出已有备份。
+
+安装副本可追溯到产生它的提交，回滚不需要重新构建。
+
+### 显式指定数据库
+
+CLI 的默认库路径取自调用进程的 `os.homedir()`，不是 Alma 配置根。当进程环境的 `HOME` 与 Alma 配置根不一致时，不传 `--db` 会读到错误的库。进程外调用一律显式传 `--db`，不要依赖默认值。
+
 ## 阶段范围
 
 阶段 1 仅提供查询接口。数据维护迁移和社区侧适配属于阶段 2、3，本阶段不实现。词卡提供表达判断所需的信息，不决定语气、玩梗尺度或发帖行为。
