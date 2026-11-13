@@ -11,8 +11,8 @@ const SEED_FILE = resolve(ROOT, 'data/seed-memes.json');
 
 const MAGPIE_URL = process.env.MAGPIE_URL || 'http://127.0.0.1:3425/v1/chat/completions';
 const MAGPIE_KEY = process.env.MAGPIE_KEY || 'magpie-alma';
-const PRIMARY_MODEL = process.env.MEME_MODEL || 'antigravity/gemini-3.8-flash';
-const FALLBACK_MODEL = 'google/models/gemini-3.5-flash-lite';
+const PRIMARY_MODEL = process.env.MEME_MODEL || 'opencode-go/deepseek-v4.1-flash';
+const FALLBACK_MODEL = process.env.MEME_FALLBACK_MODEL || '';
 
 /**
  * 抓取 B 站视频基本元数据与热评
@@ -133,7 +133,8 @@ ${meta.comments.length > 0 ? `高赞热评精选：\n${meta.comments.slice(0, 10
   try {
     return await tryModel(PRIMARY_MODEL);
   } catch (err) {
-    console.warn(`[WARN] 主模型 ${PRIMARY_MODEL} 失败 (${err.message})，尝试备选模型 ${FALLBACK_MODEL}...`);
+    if (!FALLBACK_MODEL) throw err;
+    console.warn(`[WARN] 主模型 ${PRIMARY_MODEL} 失败 (${err.message})，尝试显式配置的备选模型 ${FALLBACK_MODEL}...`);
     return await tryModel(FALLBACK_MODEL);
   }
 }
