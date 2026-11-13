@@ -38,7 +38,7 @@ function replaceOnce(text, before, after) {
   if (!text.includes(before) || text.indexOf(before) !== text.lastIndexOf(before)) {
     throw fault('UNSUPPORTED_SOURCE', `Expected one recognized block: ${before.split('\n')[0]}`);
   }
-  return text.replace(before, after);
+  return text.replace(before, () => after);
 }
 
 function shim(plan) {
