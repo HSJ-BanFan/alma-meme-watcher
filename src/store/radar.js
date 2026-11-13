@@ -436,10 +436,10 @@ const standardMetadataDescription = [
   { name: 'published_at', type: 'text', notnull: 0, default: null, pk: 0, hidden: 0 },
 ];
 const standardMetadataDigest = maintenanceDigest(standardMetadataDescription);
+const emptyMetadata = { term: null, usage_context: '', avoid_when: '', published_at: null };
 const quoteColumn = (name) => `"${name.replaceAll('"', '""')}"`;
 const snapshotValue = (value) => value instanceof Uint8Array ? { sqlite_blob: Buffer.from(value).toString('hex') }
   : typeof value === 'bigint' ? { sqlite_integer: value.toString() } : value;
-const sqliteValue = (value) => value && typeof value === 'object' && Object.hasOwn(value, 'sqlite_blob') ? Buffer.from(value.sqlite_blob, 'hex') : value;
 const snapshotRow = (row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, snapshotValue(value)]));
 const rowsEqual = (a, b) => maintenanceDigest(a) === maintenanceDigest(b);
 const identityKeys = (term) => new Set([term.term, ...decodeAliases(term.aliases)].map(identity));
@@ -453,6 +453,13 @@ function maintenanceOtherTables(db) {
     const rows = statement.all().map((row) => JSON.stringify(snapshotRow(row))).sort(compare);
     return { name, rows };
   });
+}
+
+function validateMaintenanceMetadata(row) {
+  if (typeof row.term !== 'string' || maintenanceFields.some((field) => typeof row[field] !== 'string')
+    || (row.published_at !== null && typeof row.published_at !== 'string')) {
+    fail('DATABASE_INVALID', 'The database contains invalid metadata.');
+  }
 }
 
 function maintenanceState(db) {
@@ -493,18 +500,7 @@ function maintenanceState(db) {
       }
     }
   }
-  for (const row of metadata) {
-    if (typeof row.term !== 'string' || maintenanceFields.some((field) => typeof row[field] !== 'string')
-      || (row.published_at !== null && typeof row.published_at !== 'string')) {
-      fail('DATABASE_INVALID', 'The database contains invalid metadata.');
-    }
-  }
-  const template = metadataDescription
-    ? Object.fromEntries(metadataDescription.map((column) => [column.name, snapshotValue(db.prepare(`SELECT ${column.default ?? 'NULL'} AS value`).get().value)]))
-    : { term: null, usage_context: '', avoid_when: '', published_at: null };
-  if (maintenanceFields.some((field) => typeof template[field] !== 'string')) {
-    fail('DATABASE_INVALID', 'Empty metadata rows need text defaults for the maintained fields.');
-  }
+  metadata.forEach(validateMaintenanceMetadata);
   const owners = new Map();
   for (const term of terms) {
     for (const key of identityKeys(term)) {
@@ -513,7 +509,7 @@ function maintenanceState(db) {
     }
   }
   return {
-    terms, termReviews, candidateReviews, owners, template,
+    terms, termReviews, candidateReviews, owners, emptyMetadata,
     otherTables: maintenanceOtherTables(db),
     termsByName: new Map(terms.map((term) => [term.term, term])),
     metadataByName: new Map(metadata.map((row) => [row.term, row])),
@@ -529,7 +525,7 @@ function relatedReviews(rows, keys) {
 function maintenanceTarget(state, term, fields) {
   const keys = identityKeys(term);
   const metadata = state.metadataByName.get(term.term) ?? null;
-  const template = metadata ?? { ...state.template, term: term.term };
+  const template = metadata ?? { ...state.emptyMetadata, term: term.term };
   const review = state.termReviews.find((row) => row.term === term.term);
   const target = {
     version: 1,
@@ -559,7 +555,7 @@ export function maintenanceCandidates({ dbPath = defaultDbPath, fields = mainten
       if (source !== undefined && term.source !== source) continue;
       const keys = identityKeys(term);
       if ([...keys].some((key) => state.rejected.has(key))) continue;
-      const metadata = state.metadataByName.get(term.term) ?? state.template;
+      const metadata = state.metadataByName.get(term.term) ?? state.emptyMetadata;
       const emptyFields = selected.filter((field) => !metadata[field].trim());
       if (!emptyFields.length) continue;
       if ([...keys].some((key) => state.owners.get(key).size > 1)) fail('AMBIGUOUS_IDENTITY', 'Maintenance selection found an ambiguous canonical identity.');
@@ -611,7 +607,7 @@ function maintenanceConflict(state, target, reviewStatus) {
     && !(target.expected.metadata_schema === null && state.metadataSchema === standardMetadataDigest)) {
     return { status: 'conflict', reason: 'METADATA_SCHEMA_CHANGED' };
   }
-  if (target.expected.metadata === null && !rowsEqual({ ...state.template, term: term.term }, target.expected.metadata_template)) {
+  if (target.expected.metadata === null && !rowsEqual({ ...state.emptyMetadata, term: term.term }, target.expected.metadata_template)) {
     return { status: 'conflict', reason: 'METADATA_TEMPLATE_CHANGED' };
   }
   if (reviewStatus && !rowsEqual(state.metadataByName.get(term.term) ?? null, target.expected.metadata)) {
@@ -699,8 +695,9 @@ export function applyMaintenancePatches(patches, { dbPath, now = Date.now() / 10
         for (const [field, value] of values) {
           if (metadata?.[field] === value) projected[field] = value;
         }
-        const metadataMatches = metadata ? rowsEqual(metadata, projected)
-          && (target.expected.metadata !== null || [...values].some(([field, value]) => metadata[field] === value)) : target.expected.metadata === null;
+        const metadataMatches = metadata ? (target.expected.metadata === null
+          ? [...values].every(([field, value]) => metadata[field] === value) : rowsEqual(metadata, projected))
+          : target.expected.metadata === null;
         const seen = new Set();
         for (const item of group) {
           const { record, index } = item;
@@ -729,11 +726,13 @@ export function applyMaintenancePatches(patches, { dbPath, now = Date.now() / 10
               .run(record.value, term, row[record.field], term).changes;
             expectedMetadata.set(term, { ...row, [record.field]: record.value });
           } else {
-            const inserted = { ...state.template, term, [record.field]: record.value };
-            const columns = Object.keys(inserted);
-            changes = db.prepare(`INSERT INTO watcher_entry_meta (${columns.map(quoteColumn).join(',')}) SELECT ${columns.map(() => '?').join(',')} WHERE EXISTS (SELECT 1 FROM terms WHERE term=?)`)
-              .run(...columns.map((column) => sqliteValue(inserted[column])), term).changes;
-            expectedMetadata.set(term, inserted);
+            const inserted = db.prepare(`INSERT INTO watcher_entry_meta (term,${record.field}) SELECT ?,? WHERE EXISTS (SELECT 1 FROM terms WHERE term=?) RETURNING *`)
+              .get(term, record.value, term);
+            changes = inserted ? 1 : 0;
+            if (inserted) {
+              validateMaintenanceMetadata(inserted);
+              expectedMetadata.set(term, snapshotRow(inserted));
+            }
           }
           if (changes !== 1) fail('DATABASE_ERROR', 'The conditional metadata write did not affect exactly one existing term.');
         }
