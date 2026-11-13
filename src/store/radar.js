@@ -438,8 +438,15 @@ const standardMetadataDescription = [
 const standardMetadataDigest = maintenanceDigest(standardMetadataDescription);
 const emptyMetadata = { term: null, usage_context: '', avoid_when: '', published_at: null };
 const quoteColumn = (name) => `"${name.replaceAll('"', '""')}"`;
-const snapshotValue = (value) => value instanceof Uint8Array ? { sqlite_blob: Buffer.from(value).toString('hex') }
-  : typeof value === 'bigint' ? { sqlite_integer: value.toString() } : value;
+const snapshotValue = (value) => {
+  if (value instanceof Uint8Array) return { sqlite_blob: Buffer.from(value).toString('hex') };
+  if (typeof value === 'bigint') return { sqlite_integer: value.toString() };
+  if (typeof value === 'number' && (!Number.isFinite(value) || Object.is(value, -0))) {
+    return { sqlite_real: Object.is(value, -0) ? '-0' : String(value) };
+  }
+  return value;
+};
+const snapshotNumber = (value) => value?.sqlite_real === '-0' ? -0 : value;
 const snapshotRow = (row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, snapshotValue(value)]));
 const rowsEqual = (a, b) => maintenanceDigest(a) === maintenanceDigest(b);
 const identityKeys = (term) => new Set([term.term, ...decodeAliases(term.aliases)].map(identity));
@@ -487,7 +494,7 @@ function maintenanceState(db) {
   for (const term of terms) {
     if (['term', 'aliases', 'meaning', 'example', 'origin', 'tags', 'source'].some((field) => typeof term[field] !== 'string')
       || !term.term.trim() || !term.meaning.trim()
-      || ['first_seen', 'last_seen', 'heat', 'confidence', 'ttl_days'].some((field) => typeof term[field] !== 'number' || !Number.isFinite(term[field]))) {
+      || ['first_seen', 'last_seen', 'heat', 'confidence', 'ttl_days'].some((field) => !Number.isFinite(snapshotNumber(term[field])))) {
       fail('DATABASE_INVALID', 'The database contains invalid term material.');
     }
   }
@@ -495,7 +502,7 @@ function maintenanceState(db) {
     for (const row of rows) {
       if (typeof row.term !== 'string' || typeof row[verdict] !== 'string'
         || typeof row.source_url !== 'string' || typeof row.actor !== 'string'
-        || typeof row.reviewed_at !== 'number' || !Number.isFinite(row.reviewed_at)) {
+        || !Number.isFinite(snapshotNumber(row.reviewed_at))) {
         fail('DATABASE_INVALID', 'The database contains invalid review material.');
       }
     }
@@ -770,10 +777,10 @@ export function applyMaintenanceReviews(reviews, { dbPath, now = Date.now() / 10
         const expectedReviews = state.termReviews.map((row) => ({ ...row }));
         for (const record of updates) {
           const current = expectedReviews.find((row) => row.term === record.target.canonical_term);
-          const changes = db.prepare('UPDATE term_reviews SET status=?,reviewed_at=?,actor=? WHERE term=? AND status=? AND source_url=?')
-            .run(record.status, now, 'maintenance:operator', current.term, current.status, current.source_url).changes;
-          if (changes !== 1) fail('DATABASE_ERROR', 'The conditional review write did not affect exactly one existing review.');
-          Object.assign(current, { status: record.status, reviewed_at: now, actor: 'maintenance:operator' });
+          const written = db.prepare('UPDATE term_reviews SET status=?,reviewed_at=?,actor=? WHERE term=? AND status=? AND source_url=? RETURNING reviewed_at')
+            .get(record.status, now, 'maintenance:operator', current.term, current.status, current.source_url);
+          if (!written) fail('DATABASE_ERROR', 'The conditional review write did not affect exactly one existing review.');
+          Object.assign(current, { status: record.status, reviewed_at: snapshotValue(written.reviewed_at), actor: 'maintenance:operator' });
         }
         if (state.metadataSchema === null) {
           if (!rowsEqual(maintenanceRows(db, 'terms'), state.terms) || !rowsEqual(maintenanceRows(db, 'candidate_reviews'), state.candidateReviews)
