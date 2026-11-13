@@ -350,6 +350,33 @@ test('all-refused operations do not initialize metadata or unrelated watcher/cac
   assert.deepEqual(snapshot(dbPath), before);
 });
 
+for (const removeRow of [false, true]) {
+  test(`metadata ${removeRow ? 'inserts' : 'updates'} preserve signed 64-bit INTEGER defaults`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    database(dbPath, (db) => {
+      db.exec(`ALTER TABLE watcher_entry_meta ADD COLUMN counter INTEGER NOT NULL DEFAULT 9223372036854775807;
+        ALTER TABLE watcher_entry_meta ADD COLUMN negative_counter INTEGER NOT NULL DEFAULT -9223372036854775808;`);
+      if (removeRow) db.exec('DELETE FROM watcher_entry_meta');
+    });
+    const before = snapshot(dbPath);
+    const approved = patches(dbPath, ['usage_context']).map(approve);
+    const report = applyMaintenancePatches(approved, { dbPath, now: 500 });
+    assert.equal(report.counts.updated, 1, JSON.stringify(report));
+    const after = snapshot(dbPath);
+    const expected = structuredClone(before);
+    if (removeRow) {
+      expected.data.watcher_entry_meta = [{ term: '旧词', usage_context: values.usage_context,
+        avoid_when: '', published_at: null, counter: '9223372036854775807', negative_counter: '-9223372036854775808' }];
+    } else {
+      expected.data.watcher_entry_meta[0].usage_context = values.usage_context;
+    }
+    assert.deepEqual(after, expected);
+    assert.equal(applyMaintenancePatches(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+    assert.deepEqual(snapshot(dbPath), after);
+  });
+}
+
 test('metadata inserts preserve additional column defaults and updates preserve full existing rows', (t) => {
   for (const removeRow of [false, true]) {
     const { dbPath } = temporary(t);
@@ -530,6 +557,114 @@ const scalarPaths = [
   { name: 'review with metadata', operation: 'review', setup: '', event: 'UPDATE', table: 'term_reviews' },
   { name: 'review without metadata', operation: 'review', setup: 'DROP TABLE watcher_entry_meta', event: 'UPDATE', table: 'term_reviews' },
 ];
+
+const sqlIntegers = [
+  { name: 'maximum int64', field: 'counter', sql: '9223372036854775807', adjacent: '9223372036854775806' },
+  { name: 'minimum int64', field: 'negative_counter', sql: '-9223372036854775808', adjacent: '-9223372036854775807' },
+];
+
+function seedMaintenanceIntegers(dbPath) {
+  useBlobNumbers(dbPath, ['terms', 'term_reviews', 'candidate_reviews']);
+  database(dbPath, (db) => {
+    for (const table of ['terms', 'term_reviews', 'candidate_reviews', 'watcher_entry_meta']) {
+      for (const integer of sqlIntegers) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${integer.field} INTEGER NOT NULL DEFAULT ${integer.sql}`);
+      }
+    }
+    db.exec('UPDATE terms SET first_seen=9223372036854775807; UPDATE term_reviews SET reviewed_at=-9223372036854775808');
+    db.prepare('INSERT INTO candidate_reviews (term,verdict,reason,reviewed_at,source_url,actor) VALUES (?,?,?,?,?,?)')
+      .run('旧别名', 'accepted', '保留独立审核上下文', -9223372036854775808n, sourceUrl, 'local_tool');
+  });
+}
+
+for (const operation of ['patch', 'review']) {
+  test(`maintenance INTEGER guard permits ${operation} with lossless owned-table values and replay`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    seedMaintenanceIntegers(dbPath);
+    const pending = operation === 'patch' ? patches(dbPath, ['usage_context'])
+      : previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath });
+    const approved = JSON.parse(JSON.stringify(pending.map(approve)));
+    const before = snapshot(dbPath);
+    const apply = operation === 'patch' ? applyMaintenancePatches : applyMaintenanceReviews;
+    const report = apply(approved, { dbPath, now: 500 });
+    assert.equal(report.counts.updated, 1, JSON.stringify(report));
+    const expected = structuredClone(before);
+    if (operation === 'patch') expected.data.watcher_entry_meta[0].usage_context = values.usage_context;
+    else Object.assign(expected.data.term_reviews[0], { status: 'accepted', reviewed_at: 500, actor: 'maintenance:operator' });
+    assert.deepEqual(snapshot(dbPath), expected);
+    assert.equal(apply(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+    assert.deepEqual(snapshot(dbPath), expected);
+  });
+}
+
+for (const missingMetadata of [false, true]) {
+  test(`maintenance INTEGER guard permits INTEGER review-time affinity with metadata ${missingMetadata ? 'absent' : 'present'}`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    database(dbPath, (db) => {
+      db.exec(`ALTER TABLE term_reviews RENAME TO review_time_fixture;
+        CREATE TABLE term_reviews (term TEXT PRIMARY KEY,status TEXT NOT NULL,reviewed_at INTEGER NOT NULL,source_url TEXT NOT NULL,actor TEXT NOT NULL);
+        INSERT INTO term_reviews SELECT * FROM review_time_fixture; DROP TABLE review_time_fixture;`);
+      if (missingMetadata) db.exec('DROP TABLE watcher_entry_meta');
+    });
+    const approved = JSON.parse(JSON.stringify(previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath }).map(approve)));
+    const before = snapshot(dbPath);
+    const report = applyMaintenanceReviews(approved, { dbPath, now: 500 });
+    assert.equal(report.counts.updated, 1, JSON.stringify(report));
+    const expected = structuredClone(before);
+    Object.assign(expected.data.term_reviews[0], { status: 'accepted', reviewed_at: 500, actor: 'maintenance:operator' });
+    assert.deepEqual(snapshot(dbPath), expected);
+    const stored = database(dbPath, (db) => db.prepare('SELECT typeof(reviewed_at) AS storage,CAST(reviewed_at AS TEXT) AS value FROM term_reviews').get(), true);
+    assert.deepEqual({ ...stored }, { storage: 'integer', value: '500' });
+    assert.equal(applyMaintenanceReviews(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+    assert.deepEqual(snapshot(dbPath), expected);
+  });
+}
+
+for (const path of scalarPaths) {
+  for (const integer of sqlIntegers) {
+    test(`maintenance INTEGER guard rejects ${path.name} changing ${integer.name}`, (t) => {
+      const { dbPath } = temporary(t);
+      seed(dbPath);
+      seedMaintenanceIntegers(dbPath);
+      database(dbPath, (db) => {
+        if (path.setup) db.exec(path.setup);
+        db.exec(`CREATE TRIGGER change_integer AFTER ${path.event} ON ${path.table} BEGIN
+          UPDATE ${path.table} SET ${integer.field}=${integer.adjacent} WHERE term=NEW.term; END`);
+      });
+      const pending = path.operation === 'patch' ? patches(dbPath, ['usage_context'])
+        : previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath });
+      const approved = JSON.parse(JSON.stringify(pending.map(approve)));
+      const before = snapshot(dbPath);
+      const apply = path.operation === 'patch' ? applyMaintenancePatches : applyMaintenanceReviews;
+      const report = apply(approved, { dbPath, now: 500 });
+      const after = snapshot(dbPath);
+      assert.equal(report.counts.failed, 1, JSON.stringify({ report, stored: after.data[path.table].map((row) => row[integer.field]) }));
+      assert.equal(report.error.code, 'DATABASE_ERROR');
+      assert.equal(report.outcomes[0].reason, 'TRANSACTION_ROLLED_BACK');
+      assert.deepEqual(after, before);
+    });
+  }
+}
+
+for (const [table, integer, reason] of [
+  ['terms', sqlIntegers[0], 'MATERIAL_CHANGED'],
+  ['candidate_reviews', sqlIntegers[1], 'EVIDENCE_CHANGED'],
+]) {
+  test(`maintenance INTEGER guard rejects a stale ${table} snapshot differing by one`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    seedMaintenanceIntegers(dbPath);
+    const approved = JSON.parse(JSON.stringify(patches(dbPath, ['usage_context']).map(approve)));
+    database(dbPath, (db) => db.exec(`UPDATE ${table} SET ${integer.field}=${integer.adjacent}`));
+    const before = snapshot(dbPath);
+    const report = applyMaintenancePatches(approved, { dbPath, now: 500 });
+    assert.equal(report.counts.conflict, 1, JSON.stringify(report));
+    assert.equal(report.outcomes[0].reason, reason);
+    assert.deepEqual(snapshot(dbPath), before);
+  });
+}
 
 function seedSqlScalars(dbPath) {
   database(dbPath, (db) => db.exec(`CREATE TABLE scalar_samples (id INTEGER PRIMARY KEY,value BLOB);
