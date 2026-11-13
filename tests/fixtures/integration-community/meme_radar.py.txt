@@ -1,0 +1,9 @@
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path.home() / ".config" / "alma" / "state" / "meme_radar.db"
+
+
+def lookup(text, limit=3):
+    with sqlite3.connect("file:%s?mode=ro" % DB_PATH, uri=True) as database:
+        return database.execute("select term, meaning from terms where term=? limit ?", (text, limit)).fetchall()

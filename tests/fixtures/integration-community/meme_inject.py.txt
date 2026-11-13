@@ -1,0 +1,21 @@
+import json
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "alma" / "state" / "meme_tone.json"
+DEFAULT_PLAYFULNESS = 45
+
+
+def playfulness():
+    try:
+        value = int(json.loads(CONFIG_PATH.read_text("utf-8")).get("playfulness", DEFAULT_PLAYFULNESS))
+    except Exception:
+        return DEFAULT_PLAYFULNESS
+    return max(0, min(100, value))
+
+
+def set_playfulness(value):
+    data = {}
+    data["playfulness"] = int(value)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(data), "utf-8")
+    return data

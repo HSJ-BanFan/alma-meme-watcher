@@ -1,0 +1,89 @@
+from pathlib import Path
+
+
+class Community:
+    def _catalog(self):
+        if self.catalog is None:
+            self.catalog = PublicKnowledge()
+        return self.catalog
+
+    def _knowledge(self, text: str) -> dict:
+        try:
+            terms = self._catalog().lookup(text)
+            return {"available": True, "status": "available", "terms": terms, "source": "alma-meme-watcher"}
+        except Exception as error:
+            return {"available": False, "status": "knowledge_unavailable", "terms": [], "source": "alma-meme-watcher",
+                    "errors": [{"code": "knowledge_unavailable", "type": type(error).__name__}]}
+
+    def _catalog_detail(self, detail: dict) -> dict:
+        if self.catalog is False:
+            return {}
+        post = detail["post"]
+        text = "\n".join([post["title"], post["body"]] + [node["text"] for node in detail["nodes"]])
+        return self._knowledge(text)
+
+    def scan(self, detail):
+        if detail:
+            if detail.get("post"):
+                if detail.get("nodes"):
+                    if detail.get("scope"):
+                        if not detail.get("warnings"):
+                            scope = detail["scope"]
+                            self._catalog_detail(detail)
+        return detail
+
+    def _read_detail(self, resource: str, budget: ReadBudget) -> dict:
+        incoming = self.state.incoming(resource[2:]) if resource.startswith("i:") else None
+        if resource.startswith("i:") and incoming is None:
+            raise ReadProblem("incoming_not_discovered", resource)
+        pid = incoming["post_id"] if incoming else resource[2:]
+        if budget.requests < 2:
+            raise ReadProblem("insufficient_read_budget", resource)
+        if self.contract_version >= 2:
+            self.state.invalidate_delivery(pid)
+        self._request("verify_account")
+        detail = self._request("detail", pid, 1, 50)
+        self._save_detail(detail)
+        scopes, requests = [detail["scope"]], 2
+        observed = {node["cid"] for node in detail["nodes"]}
+        target_seen = incoming is None or incoming["cid"] in observed
+        if incoming and not target_seen and requests < budget.requests:
+            sub = self._request("sub_comments", pid, incoming["root_id"])
+            requests += 1
+            self.state.ingest([{"type": "node", "data": node} for node in sub["nodes"]], scope=sub["scope"])
+            detail["nodes"].extend(sub["nodes"])
+            observed.update(node["cid"] for node in sub["nodes"])
+            scopes.append(sub["scope"])
+            target_seen = incoming["cid"] in observed
+        asset_access, image_issues = "legacy_backend_result", ()
+        if self.contract_version >= 2:
+            post = detail["post"]
+            image_issues, requests = self._prepare_assets(post["assets"], "url", budget, requests)
+            asset_access = "prepared_source_snapshots" if image_issues else "no_post_assets" if not post["assets"] else "required_images_unavailable"
+        else:
+            post = self._request("asset_files", detail["post"])
+        self.state.ingest([{"type": "detail", "data": post}], scope=detail["scope"])
+        self.state.observe_visibility(pid, observed, {"scopes": scopes, "full_history": False})
+        floor = self.state.floor(pid, incoming["root_id"]) if incoming else detail["nodes"]
+        data = {"post": post, "floor": [dict(node, currently_observed=node["cid"] in observed) for node in floor],
+                "incoming": self.state.incoming(incoming["cid"]) if incoming else None,
+                "target_currently_observed": target_seen, "knowledge": self._catalog_detail(detail)}
+        coverage = {"scopes": scopes, "requests": requests, "full_history": False,
+                    "warnings": detail["warnings"], "floor_scope": "returned_pages_only"}
+        if self.contract_version >= 2:
+            coverage["asset_access"] = asset_access
+        delivered = {node["cid"] for node in data["floor"] if node["currently_observed"]}
+        return self.result("detail", data, coverage=coverage,
+                           delivery={"post_id": pid, "cids": delivered, "scopes": scopes}, images=image_issues)
+
+    def read(self, resource, budget, query=""):
+        if resource == "knowledge":
+            knowledge = self._knowledge(query)
+            return self.result("knowledge", knowledge, errors=knowledge.get("errors"))
+        return self._read_detail(resource, budget)
+
+    def _dispatch_action(self, target, payload):
+        return {"target": target, "payload": payload}
+
+    def _refresh_operation(self, operation, budget):
+        return {"operation": operation, "requests": budget.requests}
