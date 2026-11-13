@@ -79,6 +79,74 @@ function assertMetadataOnly(before, after, fields) {
   assert.deepEqual(after, expected, 'Only the approved metadata fields may change.');
 }
 
+for (const operation of ['patch', 'review']) {
+  test(`dynamic metadata defaults do not reject an unchanged approved ${operation}`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    database(dbPath, (db) => db.exec(`DROP TABLE watcher_entry_meta;
+      CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY,usage_context TEXT NOT NULL DEFAULT '',
+        avoid_when TEXT NOT NULL DEFAULT '',published_at TEXT,nonce BLOB DEFAULT (randomblob(8)));`));
+    const select = () => operation === 'patch' ? patches(dbPath, ['usage_context'])
+      : previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath });
+    const pending = select();
+    const repeated = select();
+    const before = snapshot(dbPath);
+    const apply = operation === 'patch' ? applyMaintenancePatches : applyMaintenanceReviews;
+    const approved = pending.map(approve);
+    const report = apply(approved, { dbPath, now: 500 });
+    assert.equal(report.counts.updated, 1, JSON.stringify(report));
+    assert.deepEqual(repeated, pending, 'An unchanged database must produce the same approval target.');
+    const after = snapshot(dbPath);
+    const expected = structuredClone(before);
+    if (operation === 'patch') {
+      const [row] = after.data.watcher_entry_meta;
+      assert.ok(row.nonce instanceof Uint8Array);
+      assert.equal(row.nonce.length, 8);
+      expected.data.watcher_entry_meta = [{ term: '旧词', usage_context: values.usage_context,
+        avoid_when: '', published_at: null, nonce: row.nonce }];
+    } else {
+      Object.assign(expected.data.term_reviews[0], { status: 'accepted', reviewed_at: 500, actor: 'maintenance:operator' });
+    }
+    assert.deepEqual(after, expected);
+    assert.equal(apply(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+    assert.deepEqual(snapshot(dbPath), after);
+  });
+}
+
+test('an AFTER trigger cannot replace the inserted metadata default baseline', (t) => {
+  const { dbPath } = temporary(t);
+  seed(dbPath);
+  database(dbPath, (db) => db.exec(`DROP TABLE watcher_entry_meta;
+    CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY,usage_context TEXT NOT NULL DEFAULT '',
+      avoid_when TEXT NOT NULL DEFAULT '',published_at TEXT,nonce BLOB DEFAULT (randomblob(8)));
+    CREATE TRIGGER change_nonce AFTER INSERT ON watcher_entry_meta BEGIN
+      UPDATE watcher_entry_meta SET nonce=NULL WHERE term=NEW.term;
+    END;`));
+  const approved = patches(dbPath, ['usage_context']).map(approve);
+  const before = snapshot(dbPath);
+  const report = applyMaintenancePatches(approved, { dbPath, now: 500 });
+  assert.equal(report.counts.failed, 1, JSON.stringify(report));
+  assert.equal(report.error.code, 'DATABASE_ERROR');
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('a partial missing-row approval needs a fresh target for remaining empty fields', (t) => {
+  const { dbPath } = temporary(t);
+  seed(dbPath);
+  database(dbPath, (db) => db.exec('DELETE FROM watcher_entry_meta'));
+  const approved = patches(dbPath).map(approve);
+  assert.equal(applyMaintenancePatches([approved[0]], { dbPath, now: 500 }).counts.updated, 1);
+  const before = snapshot(dbPath);
+  const stale = applyMaintenancePatches(approved, { dbPath, now: 600 });
+  assert.equal(stale.counts.conflict, 2, JSON.stringify(stale));
+  assert.ok(stale.outcomes.every((row) => row.reason === 'METADATA_CHANGED'));
+  assert.deepEqual(snapshot(dbPath), before);
+  const fresh = patches(dbPath, ['avoid_when']).map(approve);
+  assert.equal(applyMaintenancePatches(fresh, { dbPath, now: 700 }).counts.updated, 1);
+  assertMetadataOnly(before, snapshot(dbPath), ['avoid_when']);
+  assert.equal(applyMaintenancePatches(fresh, { dbPath, now: 800 }).counts.unchanged, 1);
+});
+
 test('missing metadata rows reject redigested defaults outside the approved field', (t) => {
   for (const field of ['usage_context', 'human_note']) {
     const { dbPath } = temporary(t);
