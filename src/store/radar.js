@@ -446,18 +446,26 @@ const snapshotValue = (value) => {
   }
   return value;
 };
-const snapshotNumber = (value) => value?.sqlite_real === '-0' ? -0 : value;
+const snapshotNumber = (value) => {
+  if (value?.sqlite_real === '-0') return -0;
+  return value?.sqlite_integer !== undefined ? Number(value.sqlite_integer) : value;
+};
 const snapshotRow = (row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, snapshotValue(value)]));
 const rowsEqual = (a, b) => maintenanceDigest(a) === maintenanceDigest(b);
 const identityKeys = (term) => new Set([term.term, ...decodeAliases(term.aliases)].map(identity));
 const isRejected = (value) => value.trim().toLowerCase() === 'rejected';
-const maintenanceRows = (db, table) => db.prepare(`SELECT * FROM ${table}`).all().map(snapshotRow).sort((a, b) => compare(a.term, b.term));
+
+function maintenanceStatement(db, sql) {
+  const statement = db.prepare(sql);
+  statement.setReadBigInts(true);
+  return statement;
+}
+
+const maintenanceRows = (db, table) => maintenanceStatement(db, `SELECT * FROM ${table}`).all().map(snapshotRow).sort((a, b) => compare(a.term, b.term));
 
 function maintenanceOtherTables(db) {
   return [...tableNames(db)].filter((name) => !Object.hasOwn(maintenanceColumns, name)).sort(compare).map((name) => {
-    const statement = db.prepare(`SELECT * FROM ${quoteColumn(name)}`);
-    statement.setReadBigInts(true);
-    const rows = statement.all().map((row) => JSON.stringify(snapshotRow(row))).sort(compare);
+    const rows = maintenanceStatement(db, `SELECT * FROM ${quoteColumn(name)}`).all().map((row) => JSON.stringify(snapshotRow(row))).sort(compare);
     return { name, rows };
   });
 }
@@ -733,7 +741,7 @@ export function applyMaintenancePatches(patches, { dbPath, now = Date.now() / 10
               .run(record.value, term, row[record.field], term).changes;
             expectedMetadata.set(term, { ...row, [record.field]: record.value });
           } else {
-            const inserted = db.prepare(`INSERT INTO watcher_entry_meta (term,${record.field}) SELECT ?,? WHERE EXISTS (SELECT 1 FROM terms WHERE term=?) RETURNING *`)
+            const inserted = maintenanceStatement(db, `INSERT INTO watcher_entry_meta (term,${record.field}) SELECT ?,? WHERE EXISTS (SELECT 1 FROM terms WHERE term=?) RETURNING *`)
               .get(term, record.value, term);
             changes = inserted ? 1 : 0;
             if (inserted) {
@@ -777,7 +785,7 @@ export function applyMaintenanceReviews(reviews, { dbPath, now = Date.now() / 10
         const expectedReviews = state.termReviews.map((row) => ({ ...row }));
         for (const record of updates) {
           const current = expectedReviews.find((row) => row.term === record.target.canonical_term);
-          const written = db.prepare('UPDATE term_reviews SET status=?,reviewed_at=?,actor=? WHERE term=? AND status=? AND source_url=? RETURNING reviewed_at')
+          const written = maintenanceStatement(db, 'UPDATE term_reviews SET status=?,reviewed_at=?,actor=? WHERE term=? AND status=? AND source_url=? RETURNING reviewed_at')
             .get(record.status, now, 'maintenance:operator', current.term, current.status, current.source_url);
           if (!written) fail('DATABASE_ERROR', 'The conditional review write did not affect exactly one existing review.');
           Object.assign(current, { status: record.status, reviewed_at: snapshotValue(written.reviewed_at), actor: 'maintenance:operator' });
