@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_PLAYFULNESS, getPolicy, setPolicy } from '../src/policy/policy.mjs';
@@ -32,8 +32,31 @@ test('get defaults to 45 with visible reasons and never initializes a missing co
   assert.equal(DEFAULT_PLAYFULNESS, 45);
   assert.deepEqual(getPolicy({ almaHome }), { playfulness: 45, source: 'default', reason: 'missing_config' });
   assert.equal(existsSync(almaHome), false);
-  const expectedDefault = getPolicy({ almaHome: join(homedir(), '.config', 'alma') });
-  assert.deepEqual(getPolicy(), expectedDefault);
+});
+
+test('default policy lookup uses an isolated child home and leaves its config unchanged', (t) => {
+  const home = temporary(t);
+  const cwd = temporary(t);
+  const almaHome = join(home, '.config', 'alma');
+  const moduleUrl = new URL('../src/policy/policy.mjs', import.meta.url).href;
+  const script = `const { getPolicy } = await import(${JSON.stringify(moduleUrl)}); process.stdout.write(JSON.stringify(getPolicy()) + '\\n');`;
+  const readDefault = () => {
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd, env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, '');
+    return JSON.parse(result.stdout);
+  };
+  assert.deepEqual(readDefault(), { playfulness: 45, source: 'default', reason: 'missing_config' });
+  assert.equal(existsSync(almaHome), false);
+  const path = join(almaHome, 'state', 'meme_tone.json');
+  mkdirSync(join(almaHome, 'state'), { recursive: true });
+  const bytes = '{"playfulness":71,"foreign":{"keep":true}}';
+  writeFileSync(path, bytes);
+  assert.deepEqual(readDefault(), { playfulness: 71, source: 'config' });
+  assert.equal(readFileSync(path, 'utf8'), bytes);
 });
 
 test('get preserves legacy int conversion, truncation and clamping without touching bytes', (t) => {
