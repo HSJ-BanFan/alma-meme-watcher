@@ -13,6 +13,17 @@
 1. 任何词条入库必须具备 `term`、`meaning`、`usage_context`（使用场景/情绪极性）、`avoid_when`（禁忌场景）及合法的 `source_url`（出处原链接）。
 2. 严格使用 `src/store/radar.js` 提供的别名合并与幂等校验机制，禁止绕过事务直接写裸 SQL。
 
+## 常用维护命令
+
+- **单视频自动化提炼**：
+  ```bash
+  # 自动抓取视频素材 -> 调 Magpie (Gemini 3.8 Flash) 编译 9 字段 -> 校验归一化 -> 写入 seed-memes.json
+  npm run compile -- <BV号或链接>
+
+  # 若需要同时同步到生产数据库 (~/.config/alma/state/meme_radar.db)
+  npm run compile -- <BV号或链接> --sync
+  ```
+
 ## 验证命令
 
 任何 PR 提交前必须保持全绿：
