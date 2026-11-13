@@ -134,7 +134,7 @@ lookupCards(text, { dbPath, now, limit })
 ```bash
 node scripts/package-plugin.mjs --out <目录>
 node scripts/install-plugin.mjs --alma-home <Alma 配置根> [--package <包目录>] [--plan]
-node scripts/install-plugin.mjs --alma-home <Alma 配置根> [--package <包目录>] --apply
+node scripts/install-plugin.mjs --alma-home <Alma 配置根> [--package <包目录>] --apply [--with-skill]
 node scripts/install-plugin.mjs --alma-home <Alma 配置根> --rollback <备份 ID>
 node scripts/install-plugin.mjs --alma-home <Alma 配置根> --uninstall
 node scripts/install-plugin.mjs --alma-home <Alma 配置根> --list
@@ -148,7 +148,15 @@ node scripts/install-plugin.mjs --alma-home <Alma 配置根> --list
 
 `--apply` 先校验包内每个文件的哈希，再处理目标目录：目标不存在就直接安装；目标存在但由其他来源创建则拒绝覆盖；目标存在且与本包一致则报告 `unchanged`，不产生备份。替换前把旧目录整体移到 `_backup/plugin-alma-meme-watcher-<UTC 时间戳>/` 并写 `backup.json`，新装目录内写 `.install-receipt.json`。
 
-`--rollback <备份 ID>` 校验备份后换回旧目录并删除本次安装。`--uninstall` 只删除带安装回执的目录。`--list` 列出已有备份。
+`--rollback <备份 ID>` 校验备份后换回旧目录并删除本次安装。`--uninstall` 只删除带安装回执的目录，插件和技能都处理。`--list` 列出已有备份。
+
+新树先建在同级 `*.incoming` 目录，校验完整后整体换入，所以复制中断不会留下缺少回执的半装目录。
+
+### 技能安装
+
+`skills/meme-use` 打在插件包里不会自动被 Alma 发现，Alma 从 `<配置根>/skills/<名字>/` 读取技能。`--with-skill` 把该目录安装到 `<配置根>/skills/meme-use`，同样带 `.install-receipt.json`，同样先备份后换入，`--rollback` 和 `--uninstall` 一并处理。不加这个参数时安装器不碰技能目录。
+
+插件安装和技能安装是两次独立的可回滚写入。只装插件、不装技能时，普通读帖和查询仍然可用，只是会话里没有通用梗技能的判断指引。
 
 安装副本可追溯到产生它的提交，回滚不需要重新构建。
 

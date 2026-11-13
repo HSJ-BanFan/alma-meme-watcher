@@ -55,7 +55,12 @@ test('plan reports the action and writes nothing', (t) => {
   const { workspace, packageDir, home } = workspaceWithPackage(t);
   const planned = run(install, [`--alma-home=${home}`, `--package=${packageDir}`], workspace);
   assert.equal(planned.status, 0, planned.stderr);
-  assert.equal(planned.json.planned, 'install');
+  assert.equal(planned.json.plugin.planned, 'install');
+  assert.equal(planned.json.skill, null);
+  assert.equal(existsSync(home), false);
+  const withSkill = run(install, [`--alma-home=${home}`, `--package=${packageDir}`, '--with-skill'], workspace);
+  assert.equal(withSkill.status, 0, withSkill.stderr);
+  assert.equal(withSkill.json.skill.planned, 'install');
   assert.equal(existsSync(home), false);
 });
 
@@ -64,15 +69,31 @@ test('apply copies the package, reports its revision and repeats as a no-op', (t
   const receipt = receiptOf(packageDir);
   const first = run(install, [`--alma-home=${home}`, `--package=${packageDir}`, '--apply'], workspace);
   assert.equal(first.status, 0, first.stderr);
-  assert.equal(first.json.action, 'installed');
-  assert.equal(first.json.revision, receipt.revision);
+  assert.equal(first.json.plugin.action, 'installed');
+  assert.equal(first.json.plugin.revision, receipt.revision);
+  assert.equal(first.json.skill, null);
   const target = join(home, 'plugins', 'alma-meme-watcher');
   for (const file of receipt.files) assert.equal(sha(join(target, local(file.path))), file.sha256);
   assert.equal(existsSync(join(target, '.install-receipt.json')), true);
+  assert.equal(existsSync(join(home, 'skills', 'meme-use')), false);
   const again = run(install, [`--alma-home=${home}`, `--package=${packageDir}`, '--apply'], workspace);
   assert.equal(again.status, 0, again.stderr);
-  assert.equal(again.json.action, 'unchanged');
+  assert.equal(again.json.plugin.action, 'unchanged');
   assert.equal(existsSync(join(home, '_backup')), false);
+});
+
+test('--with-skill installs the skill where Alma reads it and uninstall removes both', (t) => {
+  const { workspace, packageDir, home } = workspaceWithPackage(t);
+  const installed = run(install, [`--alma-home=${home}`, `--package=${packageDir}`, '--apply', '--with-skill'], workspace);
+  assert.equal(installed.status, 0, installed.stderr);
+  assert.equal(installed.json.skill.action, 'installed');
+  const skill = join(home, 'skills', 'meme-use');
+  assert.match(readFileSync(join(skill, 'SKILL.md'), 'utf8'), /^---/);
+  assert.equal(existsSync(join(skill, '.install-receipt.json')), true);
+  const removed = run(install, [`--alma-home=${home}`, '--uninstall'], workspace);
+  assert.equal(removed.status, 0, removed.stderr);
+  assert.deepEqual(removed.json.removed.sort(), [join(home, 'plugins', 'alma-meme-watcher'), skill].sort());
+  assert.equal(existsSync(skill), false);
 });
 
 test('a changed install is backed up once and rollback restores it', (t) => {
@@ -83,11 +104,11 @@ test('a changed install is backed up once and rollback restores it', (t) => {
   writeFileSync(join(target, 'main.js'), localEdit);
   const replaced = run(install, [`--alma-home=${home}`, `--package=${packageDir}`, '--apply'], workspace);
   assert.equal(replaced.status, 0, replaced.stderr);
-  assert.equal(replaced.json.action, 'reinstalled');
-  assert.ok(replaced.json.backup);
+  assert.equal(replaced.json.plugin.action, 'reinstalled');
+  assert.ok(replaced.json.plugin.backup);
   assert.equal(sha(join(target, 'main.js')), receiptOf(packageDir).files.find((file) => file.path === 'main.js').sha256);
   assert.equal(readdirSync(join(home, '_backup')).length, 1);
-  const restored = run(install, [`--alma-home=${home}`, `--rollback=${replaced.json.backup}`], workspace);
+  const restored = run(install, [`--alma-home=${home}`, `--rollback=${replaced.json.plugin.backup}`], workspace);
   assert.equal(restored.status, 0, restored.stderr);
   assert.equal(readFileSync(join(target, 'main.js'), 'utf8'), localEdit);
   assert.deepEqual(readdirSync(join(home, '_backup')), []);
