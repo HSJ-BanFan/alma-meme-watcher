@@ -22,6 +22,14 @@
       "status": "compiled_and_verified"
     }
   ],
-  "last_backward_bvid": "BV174486nEYB",
-  "status": "ready"
+  "last_backward_bvid": "BV19iJ86ZEnr",
+  "status": "ready",
+  "backward_batch_2": [
+    {
+      "bvid": "BV19iJ86ZEnr",
+      "title": "结过婚我也认是什么梗【梗指南】",
+      "status": "compiled_and_verified",
+      "pr": 2
+    }
+  ]
 }
