@@ -97,6 +97,45 @@ test('ordinary reads reproduce the implicit-lookup defect, then staging removes 
   assert.ok(replayPlan.files.every((record) => record.preimage.sha256 === record.postimage.sha256));
 });
 
+test('staging preserves literal replacement characters in plugin and Alma roots', (t) => {
+  const script = String.raw`import json, math, runpy, subprocess, sys
+from pathlib import Path
+extract = runpy.run_path(sys.argv[1])["extract"]
+public = extract(Path(sys.argv[2]), "PublicKnowledge", {
+    "Path": Path, "ReadProblem": RuntimeError, "subprocess": subprocess, "json": json, "math": math,
+})
+adapter = public()
+assert adapter.entry == Path(sys.argv[3])
+assert adapter.db_path == Path(sys.argv[4])
+assert adapter.lookup("玉芬啊玉芬")[0]["term"] == "结过婚我也认"
+print(json.dumps({"ok": True}))
+`;
+  for (const field of ['pluginRoot', 'almaHome']) {
+    const env = prepare(t);
+    const root = join(env.root, "literal $& $$ $' $`");
+    if (field === 'pluginRoot') cpSync(env.pluginRoot, root, { recursive: true });
+    else mkdirSync(root);
+    env[field] = root;
+    const stage = spawnSync(process.execPath, [cli, 'stage', `--skill-dir=${env.skillDir}`,
+      `--plugin-root=${env.pluginRoot}`, `--alma-home=${env.almaHome}`], {
+      cwd: env.cwd, env: { ...process.env, HOME: env.root, USERPROFILE: env.root }, encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(stage.error, undefined);
+    assert.equal(stage.status, 0, stage.stderr);
+    assert.equal(stage.stderr, '');
+    const staged = JSON.parse(stage.stdout);
+    t.after(() => rmSync(dirname(staged.stageDir), { recursive: true, force: true }));
+    const result = spawnSync(python, ['-I', '-X', 'utf8', '-c', script, probeScript,
+      join(staged.stageDir, 'community_bindings.py'), join(env.pluginRoot, 'scripts', 'lookup.mjs'),
+      join(env.almaHome, 'state', 'meme_radar.db')], { cwd: env.cwd, encoding: 'utf8', timeout: 10000 });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, '');
+    assert.deepEqual(JSON.parse(result.stdout), { ok: true });
+    successfulProbe(staged.stageDir, { ...env, compare: env.skillDir });
+  }
+});
+
 test('planning is deterministic, read-only and binds the plugin to the co-located Alma config root', (t) => {
   const env = prepare(t);
   const before = snapshot(env.skillDir);
