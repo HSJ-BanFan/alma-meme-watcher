@@ -78,6 +78,39 @@ function successfulProbe(skillDir, options) {
   return output.result;
 }
 
+test('staged tone and scale shims preserve valid legacy integers through the real policy CLI', (t) => {
+  const env = prepare(t);
+  const before = snapshot(env.skillDir);
+  const staged = migrateCommunity({ operation: 'stage', ...env });
+  t.after(() => rmSync(dirname(staged.stageDir), { recursive: true, force: true }));
+  const home = join(env.root, 'isolated process home');
+  mkdirSync(home);
+  const childEnv = { ...process.env, HOME: home, USERPROFILE: home };
+  const policy = join(env.almaHome, 'state', 'meme_tone.json');
+  const invoke = (script, operation, token) => spawnSync(python, ['-I', '-X', 'utf8',
+    join(staged.stageDir, script), operation, token], { cwd: env.cwd, env: childEnv, encoding: 'utf8', timeout: 10000 });
+  for (const script of ['meme_inject.py', 'meme_radar.py']) {
+    for (const [operation, token, value] of [['tone', '+65', 65], ['scale', '1_0', 10], ['tone', '  +065  ', 65], ['scale', '1_0_0', 100], ['scale', '-0', 0]]) {
+      const result = invoke(script, operation, token);
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(result.stderr, '');
+      assert.deepEqual(JSON.parse(result.stdout), { playfulness: value, source: 'config' });
+      assert.deepEqual(JSON.parse(readFileSync(policy, 'utf8')), { playfulness: value, foreign: { keep: true } });
+    }
+    const saved = readFileSync(policy);
+    for (const [operation, token] of [['tone', '+101'], ['scale', '6__5'], ['scale', '-1'], ['tone', '65.0']]) {
+      const result = invoke(script, operation, token);
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.equal(result.stdout, '');
+      assert.equal(typeof JSON.parse(result.stderr).error.code, 'string');
+      assert.deepEqual(readFileSync(policy), saved);
+    }
+  }
+  assert.equal(existsSync(join(home, '.config', 'alma')), false);
+  assert.deepEqual(snapshot(env.skillDir), before);
+});
+
 test('ordinary reads reproduce the implicit-lookup defect, then staging removes it without changing the source', (t) => {
   const env = prepare(t);
   const before = snapshot(env.skillDir);

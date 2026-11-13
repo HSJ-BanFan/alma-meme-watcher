@@ -138,6 +138,35 @@ test('the policy CLI uses the Alma config root from an unrelated cwd and reports
   }
 });
 
+test('the policy CLI accepts valid legacy decimal integer spellings without losing other settings', (t) => {
+  const cwd = temporary(t);
+  const { almaHome, path } = config(t, '{"playfulness":37,"foreign":{"keep":true}}');
+  for (const [token, value] of [['+65', 65], ['1_0', 10], ['  +065  ', 65], ['-0', 0], ['0_0', 0], ['1_0_0', 100], ['00065', 65], [' 65 ', 65]]) {
+    const result = command(['set', token, '--alma-home', almaHome], cwd);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(result.stderr, '');
+    assert.equal(result.stdout, `${JSON.stringify({ playfulness: value, source: 'config' })}\n`);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), { playfulness: value, foreign: { keep: true } });
+    assert.deepEqual(readdirSync(join(almaHome, 'state')), ['meme_tone.json']);
+  }
+});
+
+test('legacy policy CLI integer spelling does not enable malformed or out-of-range setters', (t) => {
+  const cwd = temporary(t);
+  const { almaHome, path } = config(t, '{"playfulness":37,"foreign":{"keep":true}}');
+  const before = readFileSync(path);
+  for (const token of ['', ' ', '+', '-', '_65', '65_', '6__5', '+ 65', '65.0', '0x41', '6.5e1', '65 0', '+101', '-1', '1_0_1', '9999999999999999999999999']) {
+    const result = command(['set', token, `--alma-home=${almaHome}`], cwd);
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.equal(result.stdout, '');
+    const fault = JSON.parse(result.stderr);
+    assert.ok(['INVALID_ARGUMENT', 'INVALID_PLAYFULNESS'].includes(fault.error.code));
+    assert.equal(result.stderr, `${JSON.stringify(fault)}\n`);
+    assert.deepEqual(readFileSync(path), before);
+    assert.deepEqual(readdirSync(join(almaHome, 'state')), ['meme_tone.json']);
+  }
+});
+
 test('concurrent canonical setters preserve unknown settings and publish a complete JSON object', async (t) => {
   const { almaHome, path } = config(t, '{"playfulness":45,"foreign":{"keep":true}}');
   const run = (value) => new Promise((resolve, reject) => {

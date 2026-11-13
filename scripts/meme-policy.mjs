@@ -11,8 +11,8 @@ function parse(argv) {
       if (almaHome !== undefined) throw new Error('Supply --alma-home once.');
       almaHome = arg === '--alma-home' ? args[++index] : arg.slice('--alma-home='.length);
       if (!almaHome || almaHome.startsWith('--')) throw new Error('--alma-home needs a config root.');
-    } else if (operation === 'set' && value === undefined && /^\d+$/.test(arg)) {
-      value = Number(arg);
+    } else if (operation === 'set' && value === undefined && /^[+-]?\d(?:_?\d)*$/.test(arg.trim())) {
+      value = Number(arg.trim().replaceAll('_', ''));
     } else {
       throw new Error(`Unexpected argument ${arg}.`);
     }
