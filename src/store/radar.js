@@ -60,15 +60,15 @@ function options(dbPath, now) {
   }
 }
 
-function withDatabase(dbPath, write, operation) {
+function withDatabase(dbPath, write, operation, initialize = true) {
   let db;
   let transaction = false;
   try {
-    if (!write) {
+    if (!write || !initialize) {
       try {
         statSync(dbPath);
       } catch (error) {
-        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+        if (!write && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return null;
         throw error;
       }
     } else {
@@ -79,7 +79,7 @@ function withDatabase(dbPath, write, operation) {
     if (write) {
       db.exec('BEGIN IMMEDIATE');
       transaction = true;
-      db.exec(schema);
+      if (initialize) db.exec(schema);
     }
     const result = operation(db);
     if (write) {
@@ -264,6 +264,206 @@ export function syncEntries(entries, { dbPath = defaultDbPath, now = Date.now() 
     report.entries = plans.map((plan) => persisted.get(plan.canonical));
     return report;
   });
+}
+
+export function patchAvoidWhen(patches, { dbPath = defaultDbPath, authorizedCanonicalTerms, now = Date.now() / 1000 } = {}) {
+  options(dbPath, now);
+  if (!Array.isArray(patches) || patches.length === 0 || patches.length > 50) fail('INVALID_BATCH', '禁忌维护每批必须包含 1 至 50 条。');
+  if (!Array.isArray(authorizedCanonicalTerms) || authorizedCanonicalTerms.length === 0
+    || authorizedCanonicalTerms.some((term) => typeof term !== 'string' || !term.trim())) {
+    fail('INVALID_OPTIONS', '禁忌维护必须提供明确授权的 canonical 词条列表。');
+  }
+  const authorized = new Set(authorizedCanonicalTerms);
+  const seen = new Set();
+  for (const patch of patches) {
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)
+      || Object.keys(patch).length !== 3 || !['term', 'expectedAvoidWhen', 'avoidWhen'].every((field) => Object.hasOwn(patch, field))
+      || typeof patch.term !== 'string' || !patch.term.trim() || patch.term !== patch.term.trim()
+      || typeof patch.expectedAvoidWhen !== 'string' || typeof patch.avoidWhen !== 'string' || !patch.avoidWhen.trim()
+      || patch.avoidWhen.includes('\0')) fail('INVALID_BATCH', '禁忌维护只接受 term、expectedAvoidWhen 和非空 avoidWhen 字符串。');
+    const key = identity(patch.term);
+    if (seen.has(key)) fail('INVALID_BATCH', '禁忌维护批次包含重复身份。');
+    if (!authorized.has(patch.term)) fail('INVALID_BATCH', `词条 ${patch.term} 未在本批授权列表中。`);
+    seen.add(key);
+  }
+  const inspect = (db, write) => {
+    const tables = tableNames(db);
+    if (!tables.has('terms') || !tables.has('watcher_entry_meta')) fail('DATABASE_ERROR', '禁忌维护需要已有词条及元数据表。');
+    const existing = db.prepare('SELECT term,aliases FROM terms').all().map(({ term, aliases }) => ({ term, aliases: decodeAliases(aliases) }));
+    const components = connectedComponents(existing, patches.map(({ term }) => ({ term, aliases: [] })));
+    const byTerm = new Map(components.flatMap((component) => component.incoming.map((entry) => [entry.term, component])));
+    const readMeta = db.prepare('SELECT avoid_when FROM watcher_entry_meta WHERE term=?');
+    const update = write ? db.prepare('UPDATE watcher_entry_meta SET avoid_when=? WHERE term=? AND avoid_when=?') : null;
+    return patches.map((patch) => {
+      const component = byTerm.get(patch.term);
+      const conflict = (reason) => ({ term: patch.term, status: 'conflict', reason });
+      if (component.existing.length > 1) return conflict('ambiguous_identity');
+      if (component.existing.length === 0) return conflict('missing_term');
+      if (component.existing[0].term !== patch.term) return conflict('not_canonical');
+      const meta = readMeta.get(patch.term);
+      if (!meta) return conflict('missing_metadata');
+      if (meta.avoid_when === patch.avoidWhen) return { term: patch.term, status: 'unchanged' };
+      if (meta.avoid_when !== patch.expectedAvoidWhen) return conflict('stale_avoid_when');
+      if (!write) return { term: patch.term, status: 'pending' };
+      if (Number(update.run(patch.avoidWhen, patch.term, patch.expectedAvoidWhen).changes) !== 1) {
+        fail('STALE_VERSION', `词条 ${patch.term} 的禁忌维护未能更新唯一预期行。`);
+      }
+      return { term: patch.term, status: 'updated' };
+    });
+  };
+  const report = (entries) => ({
+    updated: entries.filter(({ status }) => status === 'updated').length,
+    unchanged: entries.filter(({ status }) => status === 'unchanged').length,
+    conflicted: entries.filter(({ status }) => status === 'conflict').length,
+    entries,
+  });
+  const current = withDatabase(dbPath, false, (db) => {
+    db.exec('BEGIN');
+    try { return inspect(db, false); } finally { db.exec('ROLLBACK'); }
+  });
+  if (current === null) fail('DATABASE_ERROR', '禁忌维护需要已有数据库，不能自动创建。');
+  if (!current.some(({ status }) => status === 'pending')) return report(current);
+  return withDatabase(dbPath, true, (db) => report(inspect(db, true)), false);
+}
+
+export function patchEntryContent(patches, { dbPath = defaultDbPath, authorizedCanonicalTerms, now = Date.now() / 1000 } = {}) {
+  options(dbPath, now);
+  if (!Array.isArray(patches) || patches.length === 0 || patches.length > 50) fail('INVALID_BATCH', '内容维护每批必须包含 1 至 50 条。');
+  if (!Array.isArray(authorizedCanonicalTerms) || authorizedCanonicalTerms.length === 0
+    || authorizedCanonicalTerms.some((term) => typeof term !== 'string' || !term.trim())) {
+    fail('INVALID_OPTIONS', '内容维护必须提供明确授权的 canonical 词条列表。');
+  }
+  const authorized = new Set(authorizedCanonicalTerms);
+  const seen = new Set();
+  const fields = ['term', 'expectedMeaning', 'expectedOrigin', 'expectedUsageContext', 'meaning', 'origin', 'usageContext'];
+  for (const patch of patches) {
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)
+      || Object.keys(patch).length !== fields.length || !fields.every((field) => Object.hasOwn(patch, field))
+      || typeof patch.term !== 'string' || !patch.term.trim() || patch.term !== patch.term.trim()
+      || fields.slice(1).some((field) => typeof patch[field] !== 'string')
+      || !patch.meaning.trim() || !patch.usageContext.trim()
+      || [patch.meaning, patch.origin, patch.usageContext].some((value) => value.includes('\0'))) {
+      fail('INVALID_BATCH', '内容维护只接受 term、三个期望值和三个新值字符串；释义与适用语境不能为空。');
+    }
+    const key = identity(patch.term);
+    if (seen.has(key)) fail('INVALID_BATCH', '内容维护批次包含重复身份。');
+    if (!authorized.has(patch.term)) fail('INVALID_BATCH', `词条 ${patch.term} 未在本批授权列表中。`);
+    seen.add(key);
+  }
+  const inspect = (db, write) => {
+    const tables = tableNames(db);
+    if (!tables.has('terms') || !tables.has('watcher_entry_meta')) fail('DATABASE_ERROR', '内容维护需要已有词条及元数据表。');
+    const existing = db.prepare('SELECT term,aliases FROM terms').all().map(({ term, aliases }) => ({ term, aliases: decodeAliases(aliases) }));
+    const components = connectedComponents(existing, patches.map(({ term }) => ({ term, aliases: [] })));
+    const byTerm = new Map(components.flatMap((component) => component.incoming.map((entry) => [entry.term, component])));
+    const readTerm = db.prepare('SELECT meaning,origin FROM terms WHERE term=?');
+    const readMeta = db.prepare('SELECT usage_context FROM watcher_entry_meta WHERE term=?');
+    const updateTerm = write ? db.prepare('UPDATE terms SET meaning=?, origin=? WHERE term=? AND meaning=? AND origin=?') : null;
+    const updateMeta = write ? db.prepare('UPDATE watcher_entry_meta SET usage_context=? WHERE term=? AND usage_context=?') : null;
+    return patches.map((patch) => {
+      const component = byTerm.get(patch.term);
+      const conflict = (reason) => ({ term: patch.term, status: 'conflict', reason });
+      if (component.existing.length > 1) return conflict('ambiguous_identity');
+      if (component.existing.length === 0) return conflict('missing_term');
+      if (component.existing[0].term !== patch.term) return conflict('not_canonical');
+      const term = readTerm.get(patch.term);
+      const meta = readMeta.get(patch.term);
+      if (!term || !meta) return conflict('missing_metadata');
+      if (term.meaning === patch.meaning && term.origin === patch.origin && meta.usage_context === patch.usageContext) return { term: patch.term, status: 'unchanged' };
+      if (term.meaning !== patch.expectedMeaning || term.origin !== patch.expectedOrigin || meta.usage_context !== patch.expectedUsageContext) return conflict('stale_content');
+      if (!write) return { term: patch.term, status: 'pending' };
+      if (term.meaning !== patch.meaning || term.origin !== patch.origin) {
+        if (Number(updateTerm.run(patch.meaning, patch.origin, patch.term, patch.expectedMeaning, patch.expectedOrigin).changes) !== 1) {
+          fail('STALE_VERSION', `词条 ${patch.term} 的内容维护未能更新唯一预期行。`);
+        }
+      }
+      if (meta.usage_context !== patch.usageContext) {
+        if (Number(updateMeta.run(patch.usageContext, patch.term, patch.expectedUsageContext).changes) !== 1) {
+          fail('STALE_VERSION', `词条 ${patch.term} 的适用语境维护未能更新唯一预期行。`);
+        }
+      }
+      return { term: patch.term, status: 'updated' };
+    });
+  };
+  const report = (entries) => ({
+    updated: entries.filter(({ status }) => status === 'updated').length,
+    unchanged: entries.filter(({ status }) => status === 'unchanged').length,
+    conflicted: entries.filter(({ status }) => status === 'conflict').length,
+    entries,
+  });
+  const current = withDatabase(dbPath, false, (db) => {
+    db.exec('BEGIN');
+    try { return inspect(db, false); } finally { db.exec('ROLLBACK'); }
+  });
+  if (current === null) fail('DATABASE_ERROR', '内容维护需要已有数据库，不能自动创建。');
+  if (!current.some(({ status }) => status === 'pending')) return report(current);
+  return withDatabase(dbPath, true, (db) => report(inspect(db, true)), false);
+}
+
+export function attachEntryMetadata(records, { dbPath = defaultDbPath, authorizedCanonicalTerms, now = Date.now() / 1000 } = {}) {
+  options(dbPath, now);
+  if (!Array.isArray(records) || records.length === 0 || records.length > 50) fail('INVALID_BATCH', '元数据补齐每批必须包含 1 至 50 条。');
+  if (!Array.isArray(authorizedCanonicalTerms) || authorizedCanonicalTerms.length === 0
+    || authorizedCanonicalTerms.some((term) => typeof term !== 'string' || !term.trim())) {
+    fail('INVALID_OPTIONS', '元数据补齐必须提供明确授权的 canonical 词条列表。');
+  }
+  const authorized = new Set(authorizedCanonicalTerms);
+  const seen = new Set();
+  const fields = ['term', 'usageContext', 'avoidWhen'];
+  for (const record of records) {
+    if (record === null || typeof record !== 'object' || Array.isArray(record)
+      || Object.keys(record).length !== fields.length || !fields.every((field) => Object.hasOwn(record, field))
+      || typeof record.term !== 'string' || !record.term.trim() || record.term !== record.term.trim()
+      || typeof record.usageContext !== 'string' || typeof record.avoidWhen !== 'string'
+      || !record.usageContext.trim() || !record.avoidWhen.trim()
+      || record.usageContext.includes('\0') || record.avoidWhen.includes('\0')) {
+      fail('INVALID_BATCH', '元数据补齐只接受 term、非空 usageContext 和非空 avoidWhen 字符串。');
+    }
+    const key = identity(record.term);
+    if (seen.has(key)) fail('INVALID_BATCH', '元数据补齐批次包含重复身份。');
+    if (!authorized.has(record.term)) fail('INVALID_BATCH', `词条 ${record.term} 未在本批授权列表中。`);
+    seen.add(key);
+  }
+  const inspect = (db, write) => {
+    const tables = tableNames(db);
+    if (!tables.has('terms') || !tables.has('watcher_entry_meta')) fail('DATABASE_ERROR', '元数据补齐需要已有词条及元数据表。');
+    const existing = db.prepare('SELECT term,aliases FROM terms').all().map(({ term, aliases }) => ({ term, aliases: decodeAliases(aliases) }));
+    const components = connectedComponents(existing, records.map(({ term }) => ({ term, aliases: [] })));
+    const byTerm = new Map(components.flatMap((component) => component.incoming.map((entry) => [entry.term, component])));
+    const readMeta = db.prepare('SELECT usage_context,avoid_when FROM watcher_entry_meta WHERE term=?');
+    const insert = write ? db.prepare('INSERT INTO watcher_entry_meta (term,usage_context,avoid_when,published_at) VALUES (?,?,?,NULL)') : null;
+    return records.map((record) => {
+      const component = byTerm.get(record.term);
+      const conflict = (reason) => ({ term: record.term, status: 'conflict', reason });
+      if (component.existing.length > 1) return conflict('ambiguous_identity');
+      if (component.existing.length === 0) return conflict('missing_term');
+      if (component.existing[0].term !== record.term) return conflict('not_canonical');
+      const meta = readMeta.get(record.term);
+      if (meta) {
+        return meta.usage_context === record.usageContext && meta.avoid_when === record.avoidWhen
+          ? { term: record.term, status: 'unchanged' }
+          : conflict('existing_metadata');
+      }
+      if (!write) return { term: record.term, status: 'pending' };
+      if (Number(insert.run(record.term, record.usageContext, record.avoidWhen).changes) !== 1) {
+        fail('STALE_VERSION', `词条 ${record.term} 的元数据补齐未能插入唯一行。`);
+      }
+      return { term: record.term, status: 'inserted' };
+    });
+  };
+  const report = (entries) => ({
+    inserted: entries.filter(({ status }) => status === 'inserted').length,
+    unchanged: entries.filter(({ status }) => status === 'unchanged').length,
+    conflicted: entries.filter(({ status }) => status === 'conflict').length,
+    entries,
+  });
+  const current = withDatabase(dbPath, false, (db) => {
+    db.exec('BEGIN');
+    try { return inspect(db, false); } finally { db.exec('ROLLBACK'); }
+  });
+  if (current === null) fail('DATABASE_ERROR', '元数据补齐需要已有数据库，不能自动创建。');
+  if (!current.some(({ status }) => status === 'pending')) return report(current);
+  return withDatabase(dbPath, true, (db) => report(inspect(db, true)), false);
 }
 
 function eligibility(entry, now) {

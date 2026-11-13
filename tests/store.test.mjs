@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { compileVideo } from '../src/compiler/schema.js';
-import { syncEntries, lookup, radarStatus } from '../src/store/radar.js';
+import { syncEntries, lookup, radarStatus, patchAvoidWhen, patchEntryContent, attachEntryMetadata } from '../src/store/radar.js';
 import { temporaryRadar } from './helpers.mjs';
 
 const video = JSON.parse(readFileSync(new URL('./fixtures/BV1hNWm6mEkz.json', import.meta.url), 'utf8'));
@@ -68,6 +68,494 @@ function legacyTerm(db, term, extra = {}) {
   db.prepare('INSERT INTO terms VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(term, row.aliases, row.meaning, row.example, row.origin, row.tags, row.first_seen, row.last_seen, row.heat, row.confidence, row.ttl_days, row.source);
   db.prepare('INSERT INTO term_reviews VALUES (?,?,?,?,?)').run(term, row.status, 5, row.source_url, 'human_review');
 }
+
+test('an already-correct avoid_when returns unchanged while another writer holds the database', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { avoid_when: '已修正的禁忌。' })], { dbPath, now: 100 });
+  const blocker = new DatabaseSync(dbPath);
+  blocker.exec('BEGIN IMMEDIATE');
+  try {
+    let result;
+    try {
+      const report = patchAvoidWhen([{ term: 'Alpha', expectedAvoidWhen: '旧禁忌', avoidWhen: '已修正的禁忌。' }], { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+      result = [report.updated, report.unchanged, report.conflicted];
+    } catch (error) {
+      result = { error: error.code, cause: error.cause?.message };
+    }
+    assert.deepEqual(result, [0, 1, 0]);
+  } finally {
+    blocker.exec('ROLLBACK');
+    blocker.close();
+  }
+});
+
+test('avoid_when maintenance changes only the approved metadata field', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { avoid_when: '旧Alpha' }), entry('Beta', { avoid_when: '旧Beta' }), entry('Keep')], { dbPath, now: 100 });
+  const before = snapshot(dbPath);
+  const patches = ['Alpha', 'Beta'].map((term) => ({ term, expectedAvoidWhen: `旧${term}`, avoidWhen: `新${term}禁忌。` }));
+  const report = patchAvoidWhen(patches, { dbPath, now: 200, authorizedCanonicalTerms: ['Alpha', 'Beta'] });
+  assert.deepEqual([report.updated, report.unchanged, report.conflicted], [2, 0, 0]);
+  assert.deepEqual(report.entries.map(({ term, status }) => [term, status]), [['Alpha', 'updated'], ['Beta', 'updated']]);
+  const expected = structuredClone(before);
+  for (const row of expected.watcher_entry_meta) if (row.term !== 'Keep') row.avoid_when = `新${row.term}禁忌。`;
+  assert.deepEqual(snapshot(dbPath), expected);
+});
+
+test('avoid_when replay returns unchanged without executing UPDATE', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { avoid_when: '旧Alpha' })], { dbPath, now: 100 });
+  const patches = [{ term: 'Alpha', expectedAvoidWhen: '旧Alpha', avoidWhen: '新Alpha禁忌。' }];
+  const opts = { dbPath, authorizedCanonicalTerms: ['Alpha'] };
+  patchAvoidWhen(patches, opts);
+  database(dbPath, (db) => db.exec("CREATE TRIGGER refuse_repeat BEFORE UPDATE ON watcher_entry_meta BEGIN SELECT RAISE(ABORT,'unexpected replay UPDATE'); END;"));
+  const before = snapshot(dbPath);
+  const report = patchAvoidWhen(patches, opts);
+  assert.deepEqual([report.updated, report.unchanged, report.conflicted], [0, 1, 0]);
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('avoid_when drift and missing rows are reported without inserts or overwrites', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { avoid_when: '人工修订' }), entry('Beta', { avoid_when: '旧Beta' })], { dbPath, now: 100 });
+  database(dbPath, (db) => db.prepare('DELETE FROM watcher_entry_meta WHERE term=?').run('Beta'));
+  const before = snapshot(dbPath);
+  const patches = ['Alpha', 'Beta', 'Missing'].map((term) => ({ term, expectedAvoidWhen: `旧${term}`, avoidWhen: `新${term}禁忌。` }));
+  const report = patchAvoidWhen(patches, { dbPath, authorizedCanonicalTerms: ['Alpha', 'Beta', 'Missing'] });
+  assert.deepEqual([report.updated, report.unchanged, report.conflicted], [0, 0, 3]);
+  assert.deepEqual(report.entries.map(({ reason }) => reason), ['stale_avoid_when', 'missing_metadata', 'missing_term']);
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('avoid_when patches refuse aliases and ambiguous canonical identities', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Canonical', { aliases: ['Alias'] }), entry('Other')], { dbPath, now: 100 });
+  const patch = { term: 'Alias', expectedAvoidWhen: compiled.avoid_when, avoidWhen: '新的禁忌。' };
+  let before = snapshot(dbPath);
+  let report = patchAvoidWhen([patch], { dbPath, authorizedCanonicalTerms: ['Alias'] });
+  assert.equal(report.entries[0].reason, 'not_canonical');
+  assert.deepEqual(snapshot(dbPath), before);
+  database(dbPath, (db) => db.prepare('UPDATE terms SET aliases=? WHERE term=?').run('alias', 'Other'));
+  before = snapshot(dbPath);
+  report = patchAvoidWhen([{ ...patch, term: 'Canonical' }], { dbPath, authorizedCanonicalTerms: ['Canonical'] });
+  assert.equal(report.entries[0].reason, 'ambiguous_identity');
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('invalid avoid_when patches are rejected before creating any database or directory', (t) => {
+  const dbPath = join(dirname(temporaryRadar(t)), 'not-created', 'radar.db');
+  const patch = { term: 'Alpha', expectedAvoidWhen: '旧禁忌', avoidWhen: '新禁忌。' };
+  const cases = [
+    [[], ['Alpha']],
+    [Array.from({ length: 51 }, (_, n) => ({ ...patch, term: `term${n}` })), Array.from({ length: 51 }, (_, n) => `term${n}`)],
+    [[patch, { ...patch, term: 'alpha' }], ['Alpha', 'alpha']],
+    [[{ ...patch, avoidWhen: '' }], ['Alpha']],
+    [[{ ...patch, expectedAvoidWhen: null }], ['Alpha']],
+    [[{ ...patch, usage_context: '禁止修改此字段' }], ['Alpha']],
+    [[{ ...patch, term: 'Unauthorized' }], ['Alpha']],
+    [[patch], []],
+  ];
+  for (const [patches, authorizedCanonicalTerms] of cases) {
+    assert.throws(() => patchAvoidWhen(patches, { dbPath, authorizedCanonicalTerms }), (error) => ['INVALID_BATCH', 'INVALID_OPTIONS'].includes(error.code));
+    assert.equal(existsSync(dirname(dbPath)), false);
+  }
+});
+
+test('avoid_when maintenance refuses a missing database instead of creating one', (t) => {
+  const dbPath = temporaryRadar(t);
+  assert.throws(() => patchAvoidWhen([{ term: 'Alpha', expectedAvoidWhen: '', avoidWhen: '新禁忌。' }], { dbPath, authorizedCanonicalTerms: ['Alpha'] }), failsWith('DATABASE_ERROR'));
+  assert.equal(existsSync(dbPath), false);
+});
+
+test('avoid_when maintenance does not bootstrap tables in an existing partial schema', (t) => {
+  const dbPath = temporaryRadar(t);
+  database(dbPath, (db) => {
+    db.exec(legacySchema);
+    db.exec("CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY, usage_context TEXT NOT NULL DEFAULT '', avoid_when TEXT NOT NULL DEFAULT '', published_at TEXT)");
+    legacyTerm(db, 'Alpha');
+    db.prepare('INSERT INTO watcher_entry_meta VALUES (?,?,?,?)').run('Alpha', '保持原场景', '旧禁忌', '2026-11-13');
+  });
+  const before = snapshot(dbPath);
+  patchAvoidWhen([{ term: 'Alpha', expectedAvoidWhen: '旧禁忌', avoidWhen: '新禁忌。' }], { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+  const expected = structuredClone(before);
+  expected.watcher_entry_meta[0].avoid_when = '新禁忌。';
+  assert.deepEqual(snapshot(dbPath), expected);
+  assert.equal(snapshot(dbPath).watcher_sync_versions, null);
+});
+
+test('a second avoid_when write error rolls the entire batch back and preserves its cause', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { avoid_when: '旧Alpha' }), entry('Beta', { avoid_when: '旧Beta' })], { dbPath, now: 100 });
+  database(dbPath, (db) => db.exec(`CREATE TABLE write_probe (n INTEGER); INSERT INTO write_probe VALUES (0);
+    CREATE TRIGGER fail_second BEFORE UPDATE ON watcher_entry_meta BEGIN
+      UPDATE write_probe SET n=n+1;
+      SELECT CASE WHEN (SELECT n FROM write_probe)=2 THEN RAISE(ABORT,'forced_meta_failure') END;
+    END;`));
+  const before = snapshot(dbPath);
+  const patches = ['Alpha', 'Beta'].map((term) => ({ term, expectedAvoidWhen: `旧${term}`, avoidWhen: `新${term}禁忌。` }));
+  assert.throws(() => patchAvoidWhen(patches, { dbPath, authorizedCanonicalTerms: ['Alpha', 'Beta'] }), (error) => error.code === 'DATABASE_ERROR' && error.cause?.message.includes('forced_meta_failure'));
+  assert.deepEqual(snapshot(dbPath), before);
+  assert.equal(database(dbPath, (db) => db.prepare('SELECT n FROM write_probe').get().n), 0);
+});
+
+test('content maintenance changes only meaning, origin and usage_context', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([
+    entry('Alpha', { origin: '旧Alpha出处', usage_context: '旧Alpha场景' }),
+    entry('Beta', { origin: '旧Beta出处', usage_context: '旧Beta场景' }),
+    entry('Keep'),
+  ], { dbPath, now: 100 });
+  const before = snapshot(dbPath);
+  const patches = ['Alpha', 'Beta'].map((term) => ({
+    term,
+    expectedMeaning: `${term}的明确释义。`,
+    expectedOrigin: `旧${term}出处`,
+    expectedUsageContext: `旧${term}场景`,
+    meaning: `新${term}释义。`,
+    origin: `新${term}出处`,
+    usageContext: `新${term}场景`,
+  }));
+  const report = patchEntryContent(patches, { dbPath, now: 200, authorizedCanonicalTerms: ['Alpha', 'Beta'] });
+  assert.deepEqual([report.updated, report.unchanged, report.conflicted], [2, 0, 0]);
+  assert.deepEqual(report.entries.map(({ term, status }) => [term, status]), [['Alpha', 'updated'], ['Beta', 'updated']]);
+  const expected = structuredClone(before);
+  for (const row of expected.terms) if (row.term !== 'Keep') {
+    row.meaning = `新${row.term}释义。`;
+    row.origin = `新${row.term}出处`;
+  }
+  for (const row of expected.watcher_entry_meta) if (row.term !== 'Keep') row.usage_context = `新${row.term}场景`;
+  assert.deepEqual(snapshot(dbPath), expected);
+});
+
+test('content maintenance can update usage_context alone without touching terms', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { origin: '旧Alpha出处', usage_context: '旧Alpha场景' })], { dbPath, now: 100 });
+  database(dbPath, (db) => db.exec("CREATE TRIGGER refuse_term_write BEFORE UPDATE ON terms BEGIN SELECT RAISE(ABORT,'unexpected terms UPDATE'); END;"));
+  const termsBefore = snapshot(dbPath).terms;
+  const report = patchEntryContent([{
+    term: 'Alpha',
+    expectedMeaning: 'Alpha的明确释义。',
+    expectedOrigin: '旧Alpha出处',
+    expectedUsageContext: '旧Alpha场景',
+    meaning: 'Alpha的明确释义。',
+    origin: '旧Alpha出处',
+    usageContext: '新Alpha场景。',
+  }], { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+  assert.deepEqual([report.updated, report.unchanged, report.conflicted], [1, 0, 0]);
+  const after = snapshot(dbPath);
+  assert.deepEqual(after.terms, termsBefore);
+  assert.equal(after.watcher_entry_meta.find((row) => row.term === 'Alpha').usage_context, '新Alpha场景。');
+});
+
+test('content replay returns unchanged without executing UPDATE', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { origin: '旧Alpha出处', usage_context: '旧Alpha场景' })], { dbPath, now: 100 });
+  const patches = [{
+    term: 'Alpha',
+    expectedMeaning: 'Alpha的明确释义。',
+    expectedOrigin: '旧Alpha出处',
+    expectedUsageContext: '旧Alpha场景',
+    meaning: '新Alpha释义。',
+    origin: '新Alpha出处',
+    usageContext: '新Alpha场景',
+  }];
+  const opts = { dbPath, authorizedCanonicalTerms: ['Alpha'] };
+  patchEntryContent(patches, opts);
+  database(dbPath, (db) => {
+    db.exec("CREATE TRIGGER refuse_term_repeat BEFORE UPDATE ON terms BEGIN SELECT RAISE(ABORT,'unexpected terms UPDATE'); END;");
+    db.exec("CREATE TRIGGER refuse_meta_repeat BEFORE UPDATE ON watcher_entry_meta BEGIN SELECT RAISE(ABORT,'unexpected meta UPDATE'); END;");
+  });
+  const before = snapshot(dbPath);
+  const report = patchEntryContent(patches, opts);
+  assert.deepEqual([report.updated, report.unchanged, report.conflicted], [0, 1, 0]);
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('content drift and missing rows are reported without inserts or overwrites', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([
+    entry('Alpha', { origin: '旧Alpha出处', usage_context: '旧Alpha场景' }),
+    entry('Beta', { origin: '旧Beta出处', usage_context: '旧Beta场景' }),
+  ], { dbPath, now: 100 });
+  database(dbPath, (db) => {
+    db.prepare('UPDATE terms SET meaning=? WHERE term=?').run('人工修订', 'Alpha');
+    db.prepare('DELETE FROM watcher_entry_meta WHERE term=?').run('Beta');
+  });
+  const before = snapshot(dbPath);
+  const patches = ['Alpha', 'Beta', 'Missing'].map((term) => ({
+    term,
+    expectedMeaning: `${term}的明确释义。`,
+    expectedOrigin: `旧${term}出处`,
+    expectedUsageContext: `旧${term}场景`,
+    meaning: `新${term}释义。`,
+    origin: `新${term}出处`,
+    usageContext: `新${term}场景`,
+  }));
+  const report = patchEntryContent(patches, { dbPath, authorizedCanonicalTerms: ['Alpha', 'Beta', 'Missing'] });
+  assert.deepEqual([report.updated, report.unchanged, report.conflicted], [0, 0, 3]);
+  assert.deepEqual(report.entries.map(({ reason }) => reason), ['stale_content', 'missing_metadata', 'missing_term']);
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('content patches refuse aliases and ambiguous canonical identities', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Canonical', { aliases: ['Alias'] }), entry('Other')], { dbPath, now: 100 });
+  const patch = {
+    term: 'Alias',
+    expectedMeaning: compiled.meaning,
+    expectedOrigin: compiled.origin,
+    expectedUsageContext: compiled.usage_context,
+    meaning: '新的释义。',
+    origin: '新的出处。',
+    usageContext: '新的场景。',
+  };
+  let before = snapshot(dbPath);
+  let report = patchEntryContent([patch], { dbPath, authorizedCanonicalTerms: ['Alias'] });
+  assert.equal(report.entries[0].reason, 'not_canonical');
+  assert.deepEqual(snapshot(dbPath), before);
+  database(dbPath, (db) => db.prepare('UPDATE terms SET aliases=? WHERE term=?').run('alias', 'Other'));
+  before = snapshot(dbPath);
+  report = patchEntryContent([{ ...patch, term: 'Canonical' }], { dbPath, authorizedCanonicalTerms: ['Canonical'] });
+  assert.equal(report.entries[0].reason, 'ambiguous_identity');
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('invalid content patches are rejected before creating any database or directory', (t) => {
+  const dbPath = join(dirname(temporaryRadar(t)), 'not-created-content', 'radar.db');
+  const patch = {
+    term: 'Alpha',
+    expectedMeaning: '旧释义',
+    expectedOrigin: '旧出处',
+    expectedUsageContext: '旧场景',
+    meaning: '新释义。',
+    origin: '新出处。',
+    usageContext: '新场景。',
+  };
+  const cases = [
+    [[], ['Alpha']],
+    [Array.from({ length: 51 }, (_, n) => ({ ...patch, term: `term${n}` })), Array.from({ length: 51 }, (_, n) => `term${n}`)],
+    [[patch, { ...patch, term: 'alpha' }], ['Alpha', 'alpha']],
+    [[{ ...patch, meaning: '   ' }], ['Alpha']],
+    [[{ ...patch, usageContext: '' }], ['Alpha']],
+    [[{ ...patch, expectedOrigin: null }], ['Alpha']],
+    [[{ ...patch, avoid_when: '禁止修改此字段' }], ['Alpha']],
+    [[{ ...patch, term: 'Unauthorized' }], ['Alpha']],
+    [[patch], []],
+  ];
+  for (const [patches, authorizedCanonicalTerms] of cases) {
+    assert.throws(() => patchEntryContent(patches, { dbPath, authorizedCanonicalTerms }), (error) => ['INVALID_BATCH', 'INVALID_OPTIONS'].includes(error.code));
+    assert.equal(existsSync(dirname(dbPath)), false);
+  }
+});
+
+test('content maintenance refuses a missing database instead of creating one', (t) => {
+  const dbPath = temporaryRadar(t);
+  const patch = {
+    term: 'Alpha',
+    expectedMeaning: '',
+    expectedOrigin: '',
+    expectedUsageContext: '',
+    meaning: '新释义。',
+    origin: '新出处。',
+    usageContext: '新场景。',
+  };
+  assert.throws(() => patchEntryContent([patch], { dbPath, authorizedCanonicalTerms: ['Alpha'] }), failsWith('DATABASE_ERROR'));
+  assert.equal(existsSync(dbPath), false);
+});
+
+test('content maintenance does not bootstrap tables in an existing partial schema', (t) => {
+  const dbPath = temporaryRadar(t);
+  database(dbPath, (db) => {
+    db.exec(legacySchema);
+    db.exec("CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY, usage_context TEXT NOT NULL DEFAULT '', avoid_when TEXT NOT NULL DEFAULT '', published_at TEXT)");
+    legacyTerm(db, 'Alpha');
+    db.prepare('INSERT INTO watcher_entry_meta VALUES (?,?,?,?)').run('Alpha', '保持原场景', '旧禁忌', '2026-11-13');
+  });
+  const before = snapshot(dbPath);
+  patchEntryContent([{
+    term: 'Alpha',
+    expectedMeaning: '旧版定义',
+    expectedOrigin: '旧出处',
+    expectedUsageContext: '保持原场景',
+    meaning: '新释义。',
+    origin: '新出处。',
+    usageContext: '新场景。',
+  }], { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+  const expected = structuredClone(before);
+  expected.terms[0].meaning = '新释义。';
+  expected.terms[0].origin = '新出处。';
+  expected.watcher_entry_meta[0].usage_context = '新场景。';
+  assert.deepEqual(snapshot(dbPath), expected);
+  assert.equal(snapshot(dbPath).watcher_sync_versions, null);
+});
+
+test('a second content write error rolls the entire batch back and preserves its cause', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([
+    entry('Alpha', { origin: '旧Alpha出处', usage_context: '旧Alpha场景' }),
+    entry('Beta', { origin: '旧Beta出处', usage_context: '旧Beta场景' }),
+  ], { dbPath, now: 100 });
+  database(dbPath, (db) => db.exec(`CREATE TABLE write_probe (n INTEGER); INSERT INTO write_probe VALUES (0);
+    CREATE TRIGGER fail_second BEFORE UPDATE ON watcher_entry_meta BEGIN
+      UPDATE write_probe SET n=n+1;
+      SELECT CASE WHEN (SELECT n FROM write_probe)=2 THEN RAISE(ABORT,'forced_content_failure') END;
+    END;`));
+  const before = snapshot(dbPath);
+  const patches = ['Alpha', 'Beta'].map((term) => ({
+    term,
+    expectedMeaning: `${term}的明确释义。`,
+    expectedOrigin: `旧${term}出处`,
+    expectedUsageContext: `旧${term}场景`,
+    meaning: `新${term}释义。`,
+    origin: `新${term}出处`,
+    usageContext: `新${term}场景`,
+  }));
+  assert.throws(() => patchEntryContent(patches, { dbPath, authorizedCanonicalTerms: ['Alpha', 'Beta'] }), (error) => error.code === 'DATABASE_ERROR' && error.cause?.message.includes('forced_content_failure'));
+  assert.deepEqual(snapshot(dbPath), before);
+  assert.equal(database(dbPath, (db) => db.prepare('SELECT n FROM write_probe').get().n), 0);
+});
+
+test('an already-correct content patch returns unchanged while another writer holds the database', (t) => {
+  const dbPath = temporaryRadar(t);
+  syncEntries([entry('Alpha', { origin: '新出处', usage_context: '新场景', meaning: '新释义。' })], { dbPath, now: 100 });
+  const blocker = new DatabaseSync(dbPath);
+  blocker.exec('BEGIN IMMEDIATE');
+  try {
+    const report = patchEntryContent([{
+      term: 'Alpha',
+      expectedMeaning: '旧释义',
+      expectedOrigin: '旧出处',
+      expectedUsageContext: '旧场景',
+      meaning: '新释义。',
+      origin: '新出处',
+      usageContext: '新场景',
+    }], { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+    assert.deepEqual([report.updated, report.unchanged, report.conflicted], [0, 1, 0]);
+  } finally {
+    blocker.exec('ROLLBACK');
+    blocker.close();
+  }
+});
+
+test('metadata attachment inserts a row only for terms that lack one', (t) => {
+  const dbPath = temporaryRadar(t);
+  database(dbPath, (db) => {
+    db.exec(legacySchema);
+    db.exec("CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY, usage_context TEXT NOT NULL DEFAULT '', avoid_when TEXT NOT NULL DEFAULT '', published_at TEXT)");
+    legacyTerm(db, 'Alpha');
+    legacyTerm(db, 'Beta');
+    db.prepare('INSERT INTO watcher_entry_meta VALUES (?,?,?,?)').run('Beta', '已有场景', '已有禁忌', '2026-01-01');
+  });
+  const before = snapshot(dbPath);
+  const report = attachEntryMetadata([{ term: 'Alpha', usageContext: '新场景。', avoidWhen: '新禁忌。' }], { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+  assert.deepEqual([report.inserted, report.unchanged, report.conflicted], [1, 0, 0]);
+  const after = snapshot(dbPath);
+  assert.deepEqual(after.terms, before.terms);
+  assert.deepEqual(after.term_reviews, before.term_reviews);
+  assert.deepEqual(after.watcher_sync_versions, null);
+  assert.deepEqual(after.watcher_entry_meta.find((row) => row.term === 'Beta'), before.watcher_entry_meta.find((row) => row.term === 'Beta'));
+  assert.deepEqual(after.watcher_entry_meta.find((row) => row.term === 'Alpha'), { term: 'Alpha', usage_context: '新场景。', avoid_when: '新禁忌。', published_at: null });
+});
+
+test('metadata attachment replay performs no insert', (t) => {
+  const dbPath = temporaryRadar(t);
+  database(dbPath, (db) => {
+    db.exec(legacySchema);
+    db.exec("CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY, usage_context TEXT NOT NULL DEFAULT '', avoid_when TEXT NOT NULL DEFAULT '', published_at TEXT)");
+    legacyTerm(db, 'Alpha');
+  });
+  const records = [{ term: 'Alpha', usageContext: '新场景。', avoidWhen: '新禁忌。' }];
+  attachEntryMetadata(records, { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+  database(dbPath, (db) => db.exec("CREATE TRIGGER refuse_meta_insert BEFORE INSERT ON watcher_entry_meta BEGIN SELECT RAISE(ABORT,'unexpected meta INSERT'); END;"));
+  const before = snapshot(dbPath);
+  const report = attachEntryMetadata(records, { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+  assert.deepEqual([report.inserted, report.unchanged, report.conflicted], [0, 1, 0]);
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('metadata attachment never overwrites an existing row', (t) => {
+  const dbPath = temporaryRadar(t);
+  database(dbPath, (db) => {
+    db.exec(legacySchema);
+    db.exec("CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY, usage_context TEXT NOT NULL DEFAULT '', avoid_when TEXT NOT NULL DEFAULT '', published_at TEXT)");
+    legacyTerm(db, 'Alpha');
+    db.prepare('INSERT INTO watcher_entry_meta VALUES (?,?,?,?)').run('Alpha', '人工场景', '人工禁忌', null);
+  });
+  const before = snapshot(dbPath);
+  const report = attachEntryMetadata([{ term: 'Alpha', usageContext: '新场景。', avoidWhen: '新禁忌。' }], { dbPath, authorizedCanonicalTerms: ['Alpha'] });
+  assert.equal(report.entries[0].reason, 'existing_metadata');
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('metadata attachment refuses aliases, ambiguous identities and unknown terms', (t) => {
+  const dbPath = temporaryRadar(t);
+  database(dbPath, (db) => {
+    db.exec(legacySchema);
+    db.exec("CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY, usage_context TEXT NOT NULL DEFAULT '', avoid_when TEXT NOT NULL DEFAULT '', published_at TEXT)");
+    legacyTerm(db, 'Canonical', { aliases: 'AliasOnly' });
+    legacyTerm(db, 'AmbiguousA', { aliases: 'Ambiguous' });
+    legacyTerm(db, 'AmbiguousB', { aliases: 'ambiguous' });
+  });
+  const before = snapshot(dbPath);
+  const records = ['AliasOnly', 'Ambiguous', 'Missing'].map((term) => ({ term, usageContext: '新场景。', avoidWhen: '新禁忌。' }));
+  const report = attachEntryMetadata(records, { dbPath, authorizedCanonicalTerms: ['AliasOnly', 'Ambiguous', 'Missing'] });
+  assert.deepEqual([report.inserted, report.unchanged, report.conflicted], [0, 0, 3]);
+  assert.deepEqual(report.entries.map(({ reason }) => reason), ['not_canonical', 'ambiguous_identity', 'missing_term']);
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
+test('invalid metadata records are rejected before creating any database or directory', (t) => {
+  const dbPath = join(dirname(temporaryRadar(t)), 'not-created-attach', 'radar.db');
+  const record = { term: 'Alpha', usageContext: '新场景。', avoidWhen: '新禁忌。' };
+  const cases = [
+    [[], ['Alpha']],
+    [Array.from({ length: 51 }, (_, n) => ({ ...record, term: `term${n}` })), Array.from({ length: 51 }, (_, n) => `term${n}`)],
+    [[record, { ...record, term: 'alpha' }], ['Alpha', 'alpha']],
+    [[{ ...record, usageContext: '  ' }], ['Alpha']],
+    [[{ ...record, avoidWhen: '' }], ['Alpha']],
+    [[{ ...record, expectedUsageContext: '' }], ['Alpha']],
+    [[{ ...record, term: 'Unauthorized' }], ['Alpha']],
+    [[record], []],
+  ];
+  for (const [records, authorizedCanonicalTerms] of cases) {
+    assert.throws(() => attachEntryMetadata(records, { dbPath, authorizedCanonicalTerms }), (error) => ['INVALID_BATCH', 'INVALID_OPTIONS'].includes(error.code));
+    assert.equal(existsSync(dirname(dbPath)), false);
+  }
+});
+
+test('metadata attachment refuses a missing database and never bootstraps tables', (t) => {
+  const missing = temporaryRadar(t);
+  assert.throws(() => attachEntryMetadata([{ term: 'Alpha', usageContext: '新场景。', avoidWhen: '新禁忌。' }], { dbPath: missing, authorizedCanonicalTerms: ['Alpha'] }), failsWith('DATABASE_ERROR'));
+  assert.equal(existsSync(missing), false);
+  const partial = temporaryRadar(t);
+  database(partial, (db) => {
+    db.exec(legacySchema);
+    legacyTerm(db, 'Alpha');
+  });
+  const before = snapshot(partial);
+  assert.throws(() => attachEntryMetadata([{ term: 'Alpha', usageContext: '新场景。', avoidWhen: '新禁忌。' }], { dbPath: partial, authorizedCanonicalTerms: ['Alpha'] }), failsWith('DATABASE_ERROR'));
+  assert.deepEqual(snapshot(partial), before);
+});
+
+test('a second metadata insert error rolls the whole batch back', (t) => {
+  const dbPath = temporaryRadar(t);
+  database(dbPath, (db) => {
+    db.exec(legacySchema);
+    db.exec("CREATE TABLE watcher_entry_meta (term TEXT PRIMARY KEY, usage_context TEXT NOT NULL DEFAULT '', avoid_when TEXT NOT NULL DEFAULT '', published_at TEXT)");
+    legacyTerm(db, 'Alpha');
+    legacyTerm(db, 'Beta');
+    db.exec(`CREATE TABLE insert_probe (n INTEGER); INSERT INTO insert_probe VALUES (0);
+      CREATE TRIGGER fail_second_insert BEFORE INSERT ON watcher_entry_meta BEGIN
+        UPDATE insert_probe SET n=n+1;
+        SELECT CASE WHEN (SELECT n FROM insert_probe)=2 THEN RAISE(ABORT,'forced_attach_failure') END;
+      END;`);
+  });
+  const before = snapshot(dbPath);
+  const records = ['Alpha', 'Beta'].map((term) => ({ term, usageContext: '新场景。', avoidWhen: '新禁忌。' }));
+  assert.throws(() => attachEntryMetadata(records, { dbPath, authorizedCanonicalTerms: ['Alpha', 'Beta'] }), (error) => error.code === 'DATABASE_ERROR' && error.cause?.message.includes('forced_attach_failure'));
+  assert.deepEqual(snapshot(dbPath), before);
+  assert.equal(database(dbPath, (db) => db.prepare('SELECT n FROM insert_probe').get().n), 0);
+});
 
 test('the real compiled sample round-trips through a reopened SQLite file and every gold alias', (t) => {
   const dbPath = temporaryRadar(t);
