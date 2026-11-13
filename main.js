@@ -1,30 +1,39 @@
-/**
- * alma-meme-watcher —— Alma 插件入口（骨架）。
- *
- * 职责边界：
- *   - 监控 B 站 UP 主「梗指南」(mid=94510621) 的新投稿
- *   - 提取平台字幕或音频转写，结构化提炼 { term, aliases, meaning, origin, source_url }
- *   - 写入 ~/.config/alma/state/meme_radar.db（不修改人格或直接发言）
- */
+import { compileVideo } from './src/compiler/schema.js';
+import { syncEntries, radarStatus } from './src/store/radar.js';
 
-export async function activate(context) {
+function execute(operation) {
+  return async (input) => {
+    try {
+      return { ok: true, ...operation(input) };
+    } catch (error) {
+      return { ok: false, code: error.code ?? 'INTERNAL_ERROR', message: error.message ?? String(error) };
+    }
+  };
+}
+
+export async function activate(context, { dbPath } = {}) {
   const { logger, tools } = context ?? {};
   logger?.info?.('[alma-meme-watcher] activated');
-
   if (tools?.register) {
     tools.register({
       id: 'meme_watch_status',
       name: 'Meme Watcher Status',
-      description: '查看当前梗指南监控状态与词条统计。',
-      execute: async () => ({
-        ok: true,
-        targetMid: '94510621',
-        status: 'scaffold_ready',
+      description: '读取词库统计和最近成功同步；不运行实时采集或音频转写。',
+      execute: execute(() => {
+        const status = radarStatus({ dbPath });
+        return { targetMid: '94510621', status: status.last_sync ? 'synced' : 'ready_not_synced', ...status };
+      }),
+    });
+    tools.register({
+      id: 'meme_watch_sync',
+      name: 'Sync Memes from GengZhiNan',
+      description: '编译传入的视频转录或 Agent entries，并原子同步带出处的词条；不下载视频。',
+      execute: execute((input) => {
+        const entries = compileVideo(input?.video, { entries: input?.entries });
+        return syncEntries(entries, { dbPath });
       }),
     });
   }
 }
 
-export async function deactivate() {
-  // Cleanup hook when Alma unloads the plugin.
-}
+export async function deactivate() {}
