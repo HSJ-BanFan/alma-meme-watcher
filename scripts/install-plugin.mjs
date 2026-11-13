@@ -95,17 +95,27 @@ function apply({ almaHome, packageDir }) {
     if (matchesPackage(target, receipt.files)) return { action: 'unchanged', target, revision: receipt.revision };
     const previous = readJson(receiptPath, 'REFUSE_UNKNOWN_TARGET');
     const id = backupId(backupRoot);
+    const staging = stageFiles(packageDir, target, receipt);
     mkdirSync(join(backupRoot, id), { recursive: true });
     writeFileSync(join(backupRoot, id, 'backup.json'), `${JSON.stringify({ schema: 1, id, revision: previous.revision ?? null, createdAt: new Date().toISOString() }, null, 2)}\n`);
     renameSync(target, join(backupRoot, id, PLUGIN));
-    installFiles(packageDir, target, receipt);
+    renameSync(staging, target);
     return { action: 'reinstalled', target, revision: receipt.revision, backup: id };
   }
-  installFiles(packageDir, target, receipt);
+  renameSync(stageFiles(packageDir, target, receipt), target);
   return { action: 'installed', target, revision: receipt.revision, backup: null };
 }
 
-function installFiles(packageDir, target, receipt) {
+// Build the new tree next to the target and swap it in, so a failed copy never
+// leaves a half-installed directory that the next run would refuse to replace.
+function stageFiles(packageDir, target, receipt) {
+  const staging = `${target}.incoming`;
+  rmSync(staging, { recursive: true, force: true });
+  writeTree(packageDir, staging, receipt);
+  return staging;
+}
+
+function writeTree(packageDir, target, receipt) {
   mkdirSync(target, { recursive: true });
   for (const file of receipt.files) {
     const destination = join(target, file.path.split('/').join(sep));
