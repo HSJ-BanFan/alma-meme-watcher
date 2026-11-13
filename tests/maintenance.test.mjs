@@ -519,6 +519,215 @@ test('maintenance preserves lossless protected integer and blob material during 
   assertMetadataOnly(before, snapshot(dbPath), ['usage_context']);
 });
 
+const sqlScalars = [
+  { id: 1, name: 'Infinity', sql: '9e999', value: Infinity, replacement: 'NULL' },
+  { id: 2, name: '-Infinity', sql: '-9e999', value: -Infinity, replacement: 'NULL' },
+  { id: 3, name: 'negative zero', sql: '-0.0', value: -0, replacement: '0.0' },
+];
+const scalarPaths = [
+  { name: 'metadata update', operation: 'patch', setup: '', event: 'UPDATE', table: 'watcher_entry_meta' },
+  { name: 'metadata insert', operation: 'patch', setup: 'DELETE FROM watcher_entry_meta', event: 'INSERT', table: 'watcher_entry_meta' },
+  { name: 'review with metadata', operation: 'review', setup: '', event: 'UPDATE', table: 'term_reviews' },
+  { name: 'review without metadata', operation: 'review', setup: 'DROP TABLE watcher_entry_meta', event: 'UPDATE', table: 'term_reviews' },
+];
+
+function seedSqlScalars(dbPath) {
+  database(dbPath, (db) => db.exec(`CREATE TABLE scalar_samples (id INTEGER PRIMARY KEY,value BLOB);
+    ${sqlScalars.map((scalar) => `INSERT INTO scalar_samples VALUES (${scalar.id},${scalar.sql});`).join('\n')}`));
+}
+
+for (const path of scalarPaths) {
+  for (const scalar of sqlScalars) {
+    test(`maintenance REAL guard rejects ${path.name} changing ${scalar.name}`, (t) => {
+      const { dbPath } = temporary(t);
+      seed(dbPath);
+      seedSqlScalars(dbPath);
+      database(dbPath, (db) => {
+        if (path.setup) db.exec(path.setup);
+        db.exec(`CREATE TRIGGER change_scalar AFTER ${path.event} ON ${path.table} BEGIN
+          UPDATE scalar_samples SET value=${scalar.replacement} WHERE id=${scalar.id}; END`);
+      });
+      const pending = path.operation === 'patch' ? patches(dbPath, ['usage_context'])
+        : previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath });
+      const approved = JSON.parse(JSON.stringify(pending.map(approve)));
+      const before = snapshot(dbPath);
+      assert.ok(Object.is(before.data.scalar_samples.find((row) => row.id === scalar.id).value, scalar.value));
+      const apply = path.operation === 'patch' ? applyMaintenancePatches : applyMaintenanceReviews;
+      const report = apply(approved, { dbPath, now: 500 });
+      const after = snapshot(dbPath);
+      const actual = after.data.scalar_samples.find((row) => row.id === scalar.id).value;
+      assert.equal(report.counts.failed, 1, JSON.stringify({ report, stored: String(actual), negativeZero: Object.is(actual, -0) }));
+      assert.equal(report.error.code, 'DATABASE_ERROR');
+      assert.equal(report.outcomes[0].reason, 'TRANSACTION_ROLLED_BACK');
+      assert.deepEqual(after, before);
+    });
+  }
+
+  test(`maintenance REAL guard permits ${path.name} with unchanged protected scalars`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    seedSqlScalars(dbPath);
+    seedOtherTable(dbPath);
+    if (path.setup) database(dbPath, (db) => db.exec(path.setup));
+    const pending = path.operation === 'patch' ? patches(dbPath, ['usage_context'])
+      : previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath });
+    const approved = JSON.parse(JSON.stringify(pending.map(approve)));
+    const before = snapshot(dbPath);
+    const apply = path.operation === 'patch' ? applyMaintenancePatches : applyMaintenanceReviews;
+    const report = apply(approved, { dbPath, now: 500 });
+    assert.equal(report.counts.updated, 1, JSON.stringify(report));
+    const expected = structuredClone(before);
+    if (path.operation === 'patch') {
+      if (!expected.data.watcher_entry_meta.length) {
+        expected.data.watcher_entry_meta.push({ term: '旧词', usage_context: '', avoid_when: '', published_at: null });
+      }
+      expected.data.watcher_entry_meta[0].usage_context = values.usage_context;
+    } else {
+      Object.assign(expected.data.term_reviews[0], { status: 'accepted', reviewed_at: 500, actor: 'maintenance:operator' });
+    }
+    assert.deepEqual(snapshot(dbPath), expected);
+    assert.equal(apply(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+    assert.deepEqual(snapshot(dbPath), expected);
+  });
+}
+
+for (const scalar of sqlScalars) {
+  test(`maintenance REAL guard protects an extra metadata column holding ${scalar.name}`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    database(dbPath, (db) => db.exec(`ALTER TABLE watcher_entry_meta ADD COLUMN scalar_value BLOB DEFAULT (${scalar.sql});
+      CREATE TRIGGER change_extra_scalar AFTER UPDATE ON watcher_entry_meta BEGIN
+        UPDATE watcher_entry_meta SET scalar_value=${scalar.replacement} WHERE term=NEW.term; END`));
+    const approved = JSON.parse(JSON.stringify(patches(dbPath, ['usage_context']).map(approve)));
+    const before = snapshot(dbPath);
+    assert.ok(Object.is(before.data.watcher_entry_meta[0].scalar_value, scalar.value));
+    const report = applyMaintenancePatches(approved, { dbPath, now: 500 });
+    const after = snapshot(dbPath);
+    assert.equal(report.counts.failed, 1, JSON.stringify({ report, stored: String(after.data.watcher_entry_meta[0].scalar_value) }));
+    assert.equal(report.error.code, 'DATABASE_ERROR');
+    assert.deepEqual(after, before);
+  });
+}
+
+test('maintenance REAL guard preserves existing and inserted metadata scalar defaults', (t) => {
+  for (const scalar of sqlScalars) {
+    for (const missingRow of [false, true]) {
+      const { dbPath } = temporary(t);
+      seed(dbPath);
+      database(dbPath, (db) => {
+        db.exec(`ALTER TABLE watcher_entry_meta ADD COLUMN scalar_value BLOB DEFAULT (${scalar.sql})`);
+        if (missingRow) db.exec('DELETE FROM watcher_entry_meta');
+      });
+      const approved = JSON.parse(JSON.stringify(patches(dbPath, ['usage_context']).map(approve)));
+      const before = snapshot(dbPath);
+      const report = applyMaintenancePatches(approved, { dbPath, now: 500 });
+      assert.equal(report.counts.updated, 1, JSON.stringify(report));
+      const expected = structuredClone(before);
+      if (missingRow) {
+        expected.data.watcher_entry_meta.push({ term: '旧词', usage_context: '', avoid_when: '', published_at: null, scalar_value: scalar.value });
+      }
+      expected.data.watcher_entry_meta[0].usage_context = values.usage_context;
+      assert.deepEqual(snapshot(dbPath), expected);
+      assert.equal(applyMaintenancePatches(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+      assert.deepEqual(snapshot(dbPath), expected);
+    }
+  }
+});
+
+function useBlobNumbers(dbPath, tables) {
+  database(dbPath, (db) => {
+    for (const table of tables) {
+      const original = db.prepare('SELECT sql FROM sqlite_master WHERE type=\'table\' AND name=?').get(table).sql;
+      const replacement = `${table}_numeric_fixture`;
+      db.exec(original.replace(/create table(?: if not exists)?\s+\w+/iu, `CREATE TABLE ${replacement}`)
+        .replace(/\b(?:real|integer)\b/giu, 'BLOB'));
+      db.exec(`INSERT INTO ${replacement} SELECT * FROM ${table}; DROP TABLE ${table}; ALTER TABLE ${replacement} RENAME TO ${table};`);
+    }
+  });
+}
+
+function seedNegativeZeroMaterial(dbPath) {
+  useBlobNumbers(dbPath, ['terms', 'term_reviews', 'candidate_reviews']);
+  database(dbPath, (db) => {
+    db.exec('UPDATE terms SET first_seen=-0.0,last_seen=-0.0,heat=-0.0,confidence=-0.0,ttl_days=-0.0; UPDATE term_reviews SET reviewed_at=-0.0');
+    db.prepare('INSERT INTO candidate_reviews VALUES (?,?,?,?,?,?)').run('旧别名', 'accepted', '保留独立审核上下文', -0, sourceUrl, 'local_tool');
+  });
+}
+
+for (const operation of ['patch', 'review']) {
+  test(`maintenance REAL guard permits valid negative-zero material during ${operation} and replay`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    seedNegativeZeroMaterial(dbPath);
+    const pending = operation === 'patch' ? patches(dbPath, ['usage_context'])
+      : previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath });
+    const approved = JSON.parse(JSON.stringify(pending.map(approve)));
+    const before = snapshot(dbPath);
+    for (const field of ['first_seen', 'last_seen', 'heat', 'confidence', 'ttl_days']) {
+      assert.ok(Object.is(before.data.terms[0][field], -0), field);
+    }
+    assert.ok(Object.is(before.data.term_reviews[0].reviewed_at, -0));
+    assert.ok(Object.is(before.data.candidate_reviews[0].reviewed_at, -0));
+    const apply = operation === 'patch' ? applyMaintenancePatches : applyMaintenanceReviews;
+    const report = apply(approved, { dbPath, now: operation === 'patch' ? 500 : -0 });
+    assert.equal(report.counts.updated, 1, JSON.stringify(report));
+    const expected = structuredClone(before);
+    if (operation === 'patch') expected.data.watcher_entry_meta[0].usage_context = values.usage_context;
+    else Object.assign(expected.data.term_reviews[0], { status: 'accepted', reviewed_at: -0, actor: 'maintenance:operator' });
+    assert.deepEqual(snapshot(dbPath), expected);
+    assert.equal(apply(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+    assert.deepEqual(snapshot(dbPath), expected);
+  });
+}
+
+for (const [name, mutation] of [
+  ['term material', 'UPDATE terms SET heat=0.0'],
+  ['candidate review', 'UPDATE candidate_reviews SET reviewed_at=0.0'],
+]) {
+  test(`maintenance REAL guard rejects a negative-zero change in ${name}`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    seedNegativeZeroMaterial(dbPath);
+    database(dbPath, (db) => db.exec(`CREATE TRIGGER change_signed_zero AFTER UPDATE ON watcher_entry_meta BEGIN ${mutation}; END`));
+    const approved = JSON.parse(JSON.stringify(patches(dbPath, ['usage_context']).map(approve)));
+    const before = snapshot(dbPath);
+    const report = applyMaintenancePatches(approved, { dbPath, now: 500 });
+    assert.equal(report.counts.failed, 1, JSON.stringify(report));
+    assert.equal(report.error.code, 'DATABASE_ERROR');
+    assert.deepEqual(snapshot(dbPath), before);
+  });
+}
+
+for (const affinity of ['REAL', 'BLOB']) {
+  test(`maintenance REAL guard accepts SQLite ${affinity} conversion of an approved negative-zero review time`, (t) => {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    if (affinity === 'BLOB') useBlobNumbers(dbPath, ['term_reviews']);
+    const approved = JSON.parse(JSON.stringify(previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath }).map(approve)));
+    const before = snapshot(dbPath);
+    const report = applyMaintenanceReviews(approved, { dbPath, now: -0 });
+    assert.equal(report.counts.updated, 1, JSON.stringify(report));
+    const expected = structuredClone(before);
+    Object.assign(expected.data.term_reviews[0], { status: 'accepted', reviewed_at: affinity === 'BLOB' ? -0 : 0, actor: 'maintenance:operator' });
+    assert.deepEqual(snapshot(dbPath), expected);
+    assert.equal(applyMaintenanceReviews(approved, { dbPath, now: 600 }).counts.unchanged, 1);
+    assert.deepEqual(snapshot(dbPath), expected);
+  });
+}
+
+test('maintenance REAL guard does not accept an AFTER trigger replacing the approved review time', (t) => {
+  const { dbPath } = temporary(t);
+  seed(dbPath);
+  database(dbPath, (db) => db.exec(`CREATE TRIGGER replace_review_time AFTER UPDATE ON term_reviews BEGIN
+    UPDATE term_reviews SET reviewed_at=999 WHERE term=NEW.term; END`));
+  const approved = previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath }).map(approve);
+  const before = snapshot(dbPath);
+  const report = applyMaintenanceReviews(approved, { dbPath, now: 500 });
+  assert.equal(report.counts.failed, 1, JSON.stringify(report));
+  assert.equal(report.error.code, 'DATABASE_ERROR');
+  assert.deepEqual(snapshot(dbPath), before);
+});
+
 test('maintenance lock waits are bounded and report a visible busy fault', (t) => {
   const { dbPath } = temporary(t);
   seed(dbPath);
