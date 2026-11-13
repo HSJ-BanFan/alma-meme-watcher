@@ -51,9 +51,14 @@ function database(dbPath, operation, readOnly = false) {
 function snapshot(dbPath) {
   return database(dbPath, (db) => {
     const schema = db.prepare('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name').all().map((row) => ({ ...row }));
-    const data = Object.fromEntries(schema.filter((row) => row.type === 'table').map(({ name }) => [name,
-      db.prepare(`SELECT * FROM ${quote(name)}`).all().map((row) => ({ ...row })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
-    ]));
+    const data = Object.fromEntries(schema.filter((row) => row.type === 'table').map(({ name }) => {
+      const statement = db.prepare(`SELECT * FROM ${quote(name)}`);
+      statement.setReadBigInts(true);
+      const rows = statement.all().map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
+        typeof value === 'bigint' ? (Number.isSafeInteger(Number(value)) ? Number(value) : value.toString()) : value,
+      ])));
+      return [name, rows.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))];
+    }));
     return { schema, data };
   }, true);
 }
@@ -367,6 +372,83 @@ test('a deleting metadata trigger cannot commit an orphan or change protected te
   const before = snapshot(dbPath);
   assert.equal(applyMaintenancePatches(approved, { dbPath }).counts.failed, 1);
   assert.deepEqual(snapshot(dbPath), before);
+});
+
+const otherTable = 'other "records';
+const maintenanceSideEffects = [
+  ['deletes sync history', 'DELETE FROM watcher_sync_versions'],
+  ['changes sync history', 'UPDATE watcher_sync_versions SET applied_at=999'],
+  ['changes unrelated rows', `UPDATE ${quote(otherTable)} SET note='changed',payload=x'ff00',counter=9223372036854775806`],
+];
+
+function seedOtherTable(dbPath) {
+  database(dbPath, (db) => db.exec(`CREATE TABLE ${quote(otherTable)} (id INTEGER PRIMARY KEY,note TEXT,payload BLOB,counter INTEGER);
+    INSERT INTO ${quote(otherTable)} VALUES (1,'keep',x'00ff',9223372036854775807);`));
+}
+
+for (const missingRow of [false, true]) {
+  for (const [effect, mutation] of maintenanceSideEffects) {
+    test(`maintenance postimage rejects metadata ${missingRow ? 'insert' : 'update'} that ${effect}`, (t) => {
+      const { dbPath } = temporary(t);
+      seed(dbPath);
+      seedOtherTable(dbPath);
+      database(dbPath, (db) => {
+        if (missingRow) db.exec('DELETE FROM watcher_entry_meta');
+        db.exec(`CREATE TRIGGER protected_side_effect AFTER ${missingRow ? 'INSERT' : 'UPDATE'} ON watcher_entry_meta BEGIN ${mutation}; END`);
+      });
+      const approved = patches(dbPath, ['usage_context']).map(approve);
+      const before = snapshot(dbPath);
+      const report = applyMaintenancePatches(approved, { dbPath, now: 500 });
+      const after = snapshot(dbPath);
+      const replay = syncEntries([entry()], { dbPath, now: 2000 });
+      assert.equal(report.counts.failed, 1, JSON.stringify({ report, history: after.data.watcher_sync_versions,
+        other: after.data[otherTable], replay: { updated: replay.updated, unchanged: replay.unchanged } }));
+      assert.equal(report.error.code, 'DATABASE_ERROR');
+      assert.equal(report.outcomes[0].reason, 'TRANSACTION_ROLLED_BACK');
+      assert.deepEqual(after, before);
+      assert.equal(replay.unchanged, 1);
+      assert.deepEqual(snapshot(dbPath), before);
+    });
+  }
+}
+
+for (const missingTable of [false, true]) {
+  for (const [effect, mutation] of maintenanceSideEffects) {
+    test(`maintenance postimage rejects review with metadata ${missingTable ? 'absent' : 'present'} that ${effect}`, (t) => {
+      const { dbPath } = temporary(t);
+      seed(dbPath);
+      seedOtherTable(dbPath);
+      database(dbPath, (db) => {
+        if (missingTable) db.exec('DROP TABLE watcher_entry_meta');
+        db.exec(`CREATE TRIGGER protected_side_effect AFTER UPDATE ON term_reviews BEGIN ${mutation}; END`);
+      });
+      const approved = previewMaintenanceReviews([{ term: '旧词', status: 'accepted' }], { dbPath }).map(approve);
+      const before = snapshot(dbPath);
+      const report = applyMaintenanceReviews(approved, { dbPath, now: 500 });
+      assert.equal(report.counts.failed, 1, JSON.stringify({ report, history: snapshot(dbPath).data.watcher_sync_versions }));
+      assert.equal(report.error.code, 'DATABASE_ERROR');
+      assert.equal(report.outcomes[0].reason, 'TRANSACTION_ROLLED_BACK');
+      assert.deepEqual(snapshot(dbPath), before);
+      if (!missingTable) {
+        assert.equal(syncEntries([entry()], { dbPath, now: 2000 }).unchanged, 1);
+        assert.deepEqual(snapshot(dbPath), before);
+      }
+    });
+  }
+}
+
+test('maintenance preserves lossless protected integer and blob material during a valid patch', (t) => {
+  const { dbPath } = temporary(t);
+  seed(dbPath);
+  seedOtherTable(dbPath);
+  const approved = patches(dbPath, ['usage_context']).map(approve);
+  const before = snapshot(dbPath);
+  assert.equal(applyMaintenancePatches(approved, { dbPath, now: 500 }).counts.updated, 1);
+  assertMetadataOnly(before, snapshot(dbPath), ['usage_context']);
+  const material = database(dbPath, (db) => db.prepare(`SELECT CAST(counter AS TEXT) AS counter,hex(payload) AS payload,note FROM ${quote(otherTable)}`).get(), true);
+  assert.deepEqual({ ...material }, { counter: '9223372036854775807', payload: '00FF', note: 'keep' });
+  assert.equal(syncEntries([entry()], { dbPath, now: 2000 }).unchanged, 1);
+  assertMetadataOnly(before, snapshot(dbPath), ['usage_context']);
 });
 
 test('maintenance lock waits are bounded and report a visible busy fault', (t) => {
