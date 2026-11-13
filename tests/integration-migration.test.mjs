@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { migrateCommunity } from '../integrations/xiaoheihe/migration.mjs';
+import { syncEntries } from '../src/store/radar.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/integration-community', import.meta.url));
 const pluginFixture = fileURLToPath(new URL('./fixtures/integration-plugin', import.meta.url));
@@ -181,6 +182,8 @@ test('unsupported helper and caller shapes fail planning before writing a saved 
     ['community_facade.py', (text) => `${text}\n    def new_read(self, detail):\n        return self._catalog_detail(detail)\n`],
     ['xhh_tool.py', (text) => text.replace('notes = _meme_notes("\\n".join(lines), link_id)', 'notes = _meme_notes(lines, link_id)')],
     ['meme_inject.py', (text) => `${text}\nforeign_setting = True\n`],
+    ['community_bindings.py', (text) => text.replace('        self.runner = runner or subprocess.run',
+      '        self.db_path = entry\n        self.runner = runner or subprocess.run')],
   ]) {
     const env = prepare(t);
     writeFileSync(join(env.skillDir, path), edit(readFileSync(join(env.skillDir, path), 'utf8')));
@@ -316,6 +319,41 @@ test('staged compatibility commands forward explicit lookups and the sole policy
   assert.equal(result.status, 1);
   assert.equal(JSON.parse(result.stderr).error.code, 'INVALID_POLICY');
   assert.equal(readFileSync(policyPath, 'utf8'), '{malformed');
+});
+
+test('explicit knowledge uses the selected Alma root with the real lookup CLI', (t) => {
+  const env = prepare(t);
+  const realPluginRoot = fileURLToPath(new URL('..', import.meta.url));
+  const home = join(env.root, 'separate process home');
+  mkdirSync(home);
+  const childEnv = { ...process.env, HOME: home, USERPROFILE: home };
+  const dbPath = join(env.almaHome, 'state', 'meme_radar.db');
+  const sample = JSON.parse(readFileSync(new URL('../data/seed-memes.json', import.meta.url), 'utf8'))
+    .find((entry) => entry.term === '结过婚我也认');
+  syncEntries([sample], { dbPath, now: Math.floor(Date.now() / 1000) - 3600 });
+  const before = readFileSync(dbPath);
+  const realCli = join(realPluginRoot, 'scripts', 'lookup.mjs');
+  const direct = spawnSync(process.execPath, [realCli, '--text=玉芬啊玉芬', `--db=${dbPath}`],
+    { cwd: env.cwd, env: childEnv, encoding: 'utf8', timeout: 10000 });
+  assert.equal(direct.status, 0, direct.stderr);
+  assert.equal(direct.stderr, '');
+  const expected = JSON.parse(direct.stdout).terms;
+  assert.equal(expected.length, 1);
+  assert.equal(expected[0].term, '结过婚我也认');
+  const staged = migrateCommunity({ operation: 'stage', ...env, pluginRoot: realPluginRoot });
+  t.after(() => rmSync(dirname(staged.stageDir), { recursive: true, force: true }));
+  const helper = fileURLToPath(new URL('./fixtures/integration-real-knowledge.py', import.meta.url));
+  for (const [text, terms] of [['玉芬啊玉芬', expected], ['unknown_real_cli_fixture', []]]) {
+    const result = spawnSync(python, ['-I', '-X', 'utf8', helper,
+      join(staged.stageDir, 'community_bindings.py'), text],
+    { cwd: env.cwd, env: childEnv, encoding: 'utf8', timeout: 10000 });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(result.stderr, '');
+    assert.deepEqual(JSON.parse(result.stdout), { ok: true, terms });
+  }
+  assert.equal(existsSync(join(home, '.config', 'alma')), false);
+  assert.deepEqual(readFileSync(dbPath), before);
 });
 
 if (process.env.MEME_INTEGRATION_INSTALLED_SKILL) {

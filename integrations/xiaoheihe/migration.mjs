@@ -113,7 +113,23 @@ function transform(path, bytes, plan) {
       throw fault('UNSUPPORTED_SOURCE', 'Unrecognized PublicKnowledge binding.');
     }
     const entry = join(plan.pluginRoot, 'scripts', 'lookup.mjs').replaceAll('\\', '/');
-    text = replaceOnce(text, defaults[0], `        self.entry = entry or Path(${JSON.stringify(entry)})`);
+    const entryLine = `        self.entry = entry or Path(${JSON.stringify(entry)})`;
+    const dbPath = join(plan.almaHome, 'state', 'meme_radar.db').replaceAll('\\', '/');
+    const dbLine = `        self.db_path = Path(${JSON.stringify(dbPath)})`;
+    const oldCall = 'self.runner(["node", str(self.entry), "--text=" + text, "--limit", str(limit)]';
+    const boundCall = 'self.runner(["node", str(self.entry), "--text=" + text, "--limit", str(limit), "--db", str(self.db_path)]';
+    const dbDefaults = text.match(/^        self\.db_path = Path\("(?:[^"\\]|\\.)*"\)$/gm) ?? [];
+    text = replaceOnce(text, defaults[0], entryLine);
+    if (dbDefaults.length) {
+      if (dbDefaults.length !== 1 || dbDefaults[0] !== dbLine || !text.includes(boundCall) || text.includes(oldCall)
+          || (text.match(/\bself\.db_path\b/g) ?? []).length !== 2) {
+        throw fault('UNSUPPORTED_SOURCE', 'Unrecognized PublicKnowledge database binding.');
+      }
+    } else {
+      if (/\bself\.db_path\b/.test(text)) throw fault('UNSUPPORTED_SOURCE', 'Unrecognized existing database binding.');
+      text = replaceOnce(text, entryLine, `${entryLine}\n${dbLine}`);
+      text = replaceOnce(text, oldCall, boundCall);
+    }
   } else if (legacyHashes[path]) {
     const replacement = shim(plan);
     if (text !== replacement && !legacyHashes[path].has(hash(text))) {
