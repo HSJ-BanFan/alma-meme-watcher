@@ -186,7 +186,12 @@ def function_hashes(path: Path, excluded: set[str]) -> dict[str, str]:
                 name = ".".join(key)
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and name not in excluded:
                     start = min([node.lineno] + [decorator.lineno for decorator in node.decorator_list])
-                    result[name] = hashlib.sha256(b"".join(lines[start - 1:node.end_lineno])).hexdigest()
+                    body = b"".join(lines[start - 1:node.end_lineno])
+                    if name == "PublicKnowledge.lookup":
+                        binding = b', "--db", str(self.db_path)'
+                        assert body.count(binding) <= 1, "Unexpected repeated public database binding"
+                        body = body.replace(binding, b"")
+                    result[name] = hashlib.sha256(body).hexdigest()
                 visit(node.body, key)
 
     visit(ast.parse(source, filename=str(path)).body)

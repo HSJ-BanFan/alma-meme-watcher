@@ -16,7 +16,7 @@ When the source lives under `<alma-config-root>/skills`, the default plugin root
 
 Review the plan's `sourceRoot`, `pluginRoot`, `almaHome`, SHA-256 `digest`, and `files`. Each file has a preimage and postimage hash and mode. Changed files also contain base64 preimage and postimage bytes. Unchanged records protect the copied source, including the backfill file. The digest detects plan changes; it is not authentication or approval.
 
-Recognized changes remove only the facade's implicit `data.knowledge` attachment, `_catalog_detail`, its ignored scan call, and the post and floor notes blocks with `_meme_notes`. The explicit `read knowledge --query` route and public protocol validator remain. `PublicKnowledge` receives an absolute installed lookup path instead of a repository checkout path.
+Recognized changes remove only the facade's implicit `data.knowledge` attachment, `_catalog_detail`, its ignored scan call, and the post and floor notes blocks with `_meme_notes`. The explicit `read knowledge --query` route and public protocol validator remain. `PublicKnowledge` receives an absolute installed lookup path and passes `--db` for the selected Alma root's `state/meme_radar.db`. The CLI default follows the calling process's `homedir()`, so the adapter never relies on it.
 
 When present, the recognized legacy `meme_inject.py` and `meme_radar.py` become explicit public-CLI shims. Supported helper fingerprints cover the installed 2026-11-13 source and the portable test fixtures. Helper drift fails planning rather than discarding unknown code. The shims forward `lookup` and policy `get` or `set`; legacy `tone` and `scale` forward to the same policy CLI. Implicit brief generation, private SQLite reads, and the second policy writer are retired. Imported legacy helper functions are not retained.
 
@@ -44,7 +44,9 @@ To exercise an installed source version without installing changes, set `MEME_IN
 
 The portable Python source fixtures are `.py.txt` data. The tests materialize them as `.py` only in temporary skill trees. The Python probe executes the extracted `read_post`, `read_floor`, and facade `_read_detail` bodies with fixed content and fake SDK calls. The unmodified fixture fails with one implicit lookup per path. The staged copy requires zero lookups, no attached knowledge or notes, ordered post text and images, exact floor relationships, account verification, and detail delivery. A second run omits the meme helpers entirely. The explicit knowledge probe executes the public adapter against a synthetic lookup CLI and checks success, no-hit, missing or corrupt database faults, protocol errors, and timeout handling.
 
-Protected-function hashes and whole-file hashes supplement those behavior checks. These tests do not execute a live Alma session or prove that an agent follows natural-language skill instructions.
+A separate regression invokes the staged `PublicKnowledge` class against the real lookup CLI. Its process home differs from the selected Alma config root. The test requires the same fixed-alias card as an explicit `--db` invocation, successful no-hit, and unchanged temporary database bytes. The synthetic CLI remains only a protocol test fixture, never an installed runtime path.
+
+Protected-function hashes and whole-file hashes supplement those behavior checks. The hash comparison removes only the planned `--db` argument pair from `PublicKnowledge.lookup`; every other byte of that function remains protected. These tests do not execute a live Alma session or prove that an agent follows natural-language skill instructions.
 
 ## Apply only after the installation gate
 
