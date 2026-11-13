@@ -20,7 +20,7 @@ const lookupParameters = {
   required: ['text'],
   properties: {
     text: { type: 'string' },
-    limit: { type: 'integer', minimum: 0, default: 3 },
+    limit: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 3 },
   },
 };
 

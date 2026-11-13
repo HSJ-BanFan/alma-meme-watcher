@@ -103,10 +103,10 @@ lookupCards(text, { dbPath, now, limit })
 
 ```json
 {"type":"object","additionalProperties":false,"required":["text"],
- "properties":{"text":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":3}}}
+ "properties":{"text":{"type":"string"},"limit":{"type":"integer","minimum":0,"maximum":9007199254740991,"default":3}}}
 ```
 
-`text` 必填，允许空字符串和纯空白。`limit` 省略时按 `3` 处理；一旦出现，就必须是 `0` 到 `Number.MAX_SAFE_INTEGER` 的安全整数。除 `text` 和 `limit` 之外的键（例如 `dbPath`、`now`）一律拒绝，避免调用方绕过契约直接指定数据库或时钟。
+`text` 必填，允许空字符串和纯空白。`limit` 省略时按 `3` 处理；一旦出现，就必须是 `0` 到 `Number.MAX_SAFE_INTEGER` 的安全整数，schema 用 `minimum` 和 `maximum` 表达同一范围。除 `text` 和 `limit` 之外的键（例如 `dbPath`、`now`）一律拒绝，避免调用方绕过契约直接指定数据库或时钟。
 
 ### 输出
 

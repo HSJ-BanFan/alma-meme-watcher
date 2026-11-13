@@ -75,7 +75,7 @@ test('tools register with two arguments, object schemas and exactly the manifest
   assert.deepEqual(calls.map(([id]) => id).sort(), manifest.contributes.tools.map(({ id }) => id).sort());
   assert.deepEqual(calls.find(([id]) => id === 'meme_watch_lookup')[1].parameters, {
     type: 'object', additionalProperties: false, required: ['text'],
-    properties: { text: { type: 'string' }, limit: { type: 'integer', minimum: 0, default: 3 } },
+    properties: { text: { type: 'string' }, limit: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 3 } },
   });
   assert.equal(typeof lifecycle.dispose, 'function');
 });
