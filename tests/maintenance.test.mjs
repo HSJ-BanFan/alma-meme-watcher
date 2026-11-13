@@ -74,6 +74,33 @@ function assertMetadataOnly(before, after, fields) {
   assert.deepEqual(after, expected, 'Only the approved metadata fields may change.');
 }
 
+test('missing metadata rows reject redigested defaults outside the approved field', (t) => {
+  for (const field of ['usage_context', 'human_note']) {
+    const { dbPath } = temporary(t);
+    seed(dbPath);
+    database(dbPath, (db) => {
+      db.exec("ALTER TABLE watcher_entry_meta ADD COLUMN human_note TEXT NOT NULL DEFAULT '原有默认备注'");
+      db.prepare('DELETE FROM watcher_entry_meta WHERE term=?').run('旧词');
+    });
+    const [target] = maintenanceCandidates({ dbPath, fields: ['avoid_when'] });
+    const forged = structuredClone(target);
+    forged.expected.metadata_template[field] = '未经批准的额外字段内容不得由此记录写入。';
+    forged.digest = targetDigest(forged);
+    const before = snapshot(dbPath);
+    const refused = applyMaintenancePatches([approve(draftPatch(forged, 'avoid_when', values.avoid_when))], { dbPath });
+    assert.equal(refused.counts.conflict, 1, JSON.stringify({ report: refused,
+      metadata: database(dbPath, (db) => db.prepare('SELECT * FROM watcher_entry_meta WHERE term=?').get('旧词'), true) }));
+    assert.equal(refused.outcomes[0].reason, 'METADATA_TEMPLATE_CHANGED');
+    assert.deepEqual(snapshot(dbPath), before);
+    const applied = applyMaintenancePatches([approve(draftPatch(target, 'avoid_when', values.avoid_when))], { dbPath });
+    assert.equal(applied.counts.updated, 1);
+    const expected = structuredClone(before);
+    expected.data.watcher_entry_meta = [{ term: '旧词', usage_context: '', avoid_when: values.avoid_when,
+      published_at: null, human_note: '原有默认备注' }];
+    assert.deepEqual(snapshot(dbPath), expected);
+  }
+});
+
 test('candidates are readonly exact snapshots with empty-field, source and limit selection', (t) => {
   const { dbPath } = temporary(t);
   seed(dbPath, [entry('A词'), entry('B词', { aliases: [], usage_context: '已有明确使用场景，不需要补写。' }), entry('C词', { aliases: [], usage_context: values.usage_context, avoid_when: values.avoid_when })]);

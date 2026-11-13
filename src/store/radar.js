@@ -600,6 +600,9 @@ function maintenanceConflict(state, target, reviewStatus) {
     && !(target.expected.metadata_schema === null && state.metadataSchema === standardMetadataDigest)) {
     return { status: 'conflict', reason: 'METADATA_SCHEMA_CHANGED' };
   }
+  if (target.expected.metadata === null && !rowsEqual({ ...state.template, term: term.term }, target.expected.metadata_template)) {
+    return { status: 'conflict', reason: 'METADATA_TEMPLATE_CHANGED' };
+  }
   if (reviewStatus && !rowsEqual(state.metadataByName.get(term.term) ?? null, target.expected.metadata)) {
     return { status: 'conflict', reason: 'METADATA_CHANGED' };
   }
@@ -714,7 +717,7 @@ export function applyMaintenancePatches(patches, { dbPath, now = Date.now() / 10
               .run(record.value, term, row[record.field], term).changes;
             expectedMetadata.set(term, { ...row, [record.field]: record.value });
           } else {
-            const inserted = { ...record.target.expected.metadata_template, [record.field]: record.value };
+            const inserted = { ...state.template, term, [record.field]: record.value };
             const columns = Object.keys(inserted);
             changes = db.prepare(`INSERT INTO watcher_entry_meta (${columns.map(quoteColumn).join(',')}) SELECT ${columns.map(() => '?').join(',')} WHERE EXISTS (SELECT 1 FROM terms WHERE term=?)`)
               .run(...columns.map((column) => sqliteValue(inserted[column])), term).changes;
