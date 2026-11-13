@@ -2,12 +2,9 @@
   "name": "alma-meme-watcher",
   "version": "0.1.0",
   "type": "module",
-  "description": "Alma plugin that monitors Bilibili UP 94510621 (梗指南) and syncs sourced meme definitions into meme_radar.db.",
+  "description": "Alma plugin for multi-source meme monitoring, structured definition compilation, and SQLite sync into meme_radar.db.",
   "license": "MIT",
   "main": "main.js",
-  "engines": {
-    "node": ">=22.13.0"
-  },
   "scripts": {
     "test": "node --test tests/*.test.mjs"
   }

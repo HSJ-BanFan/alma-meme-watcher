@@ -2,7 +2,7 @@
   "id": "alma-meme-watcher",
   "name": "Meme Watcher",
   "version": "0.1.0",
-  "description": "将传入的 B 站视频转录或 Agent 结构化词条同步到 Alma 的 meme_radar.db；不含实时采集或音频转写。",
+  "description": "多源热梗监控与提炼引擎：追踪B站解梗UP主（如梗指南94510621及更多源）与社媒新词，提取出处并编译结构化词条同步至 Alma meme_radar.db。",
   "author": {
     "name": "HSJ-BanFan",
     "url": "https://github.com/HSJ-BanFan"
@@ -25,12 +25,12 @@
       {
         "id": "meme_watch_status",
         "name": "Meme Watcher Status",
-        "description": "读取实际词库统计与最近成功同步；实时采集和音频转写尚未实现。"
+        "description": "查看当前多源监控状态、已配置数据源列表及词条库统计。"
       },
       {
         "id": "meme_watch_sync",
-        "name": "Sync Memes from GengZhiNan",
-        "description": "编译传入的 B 站视频转录或 Agent entries，并原子同步带出处的词条；不拉取投稿。"
+        "name": "Sync Memes from Watcher",
+        "description": "执行多源素材拉取、字幕/转写提取与带出处的结构化热梗词条同步入库。"
       }
     ]
   }
