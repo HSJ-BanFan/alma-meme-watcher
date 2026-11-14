@@ -90,7 +90,13 @@ def probe(skill: Path, absent: bool = False) -> dict[str, Any]:
     assert facade_output["kind"] == "detail"
     assert facade_output["data"]["post"] == detail["post"]
     assert facade_output["data"]["floor"] == [{"cid": "11", "text": "Fixture root", "currently_observed": True}]
-    assert facade_output["delivery"] == {"post_id": "17", "cids": {"11"}, "scopes": ["fixture-scope"]}
+    delivery = facade_output["delivery"]
+    assert {key: delivery[key] for key in ("post_id", "cids", "scopes")} == {
+        "post_id": "17", "cids": {"11"}, "scopes": ["fixture-scope"]}
+    # Current community sources add text_only to reply-target deliveries; the
+    # legacy fixture predates it, so a post read may omit it but must never set it.
+    assert set(delivery) <= {"post_id", "cids", "scopes", "text_only"}
+    assert delivery.get("text_only", False) is False
     assert events == ["verify_account", "detail", "asset_files"]
     failures = [name for name, count in calls.items() if count != 0]
     if "knowledge" in facade_output["data"]:
